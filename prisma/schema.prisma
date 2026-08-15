@@ -1,0 +1,106 @@
+// =============================================================================
+// Prisma Schema — WhatsApp Chat Backend
+// Prisma version: 5.x (stable)
+// =============================================================================
+// Provider is "sqlite" for local development.
+//
+// To switch to PostgreSQL:
+//   1. Change provider to "postgresql"
+//   2. Update DATABASE_URL in .env to a postgres connection string
+//      e.g. DATABASE_URL="postgresql://user:password@localhost:5432/whatsapp_db"
+//   3. Re-run: npx prisma migrate dev
+//   No other changes needed — models are compatible with both providers.
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// =============================================================================
+// Chat — represents a WhatsApp conversation (individual or group)
+// =============================================================================
+model Chat {
+  /// WhatsApp JID (e.g. "1234567890@s.whatsapp.net" or "groupid@g.us")
+  id            String    @id
+  /// Display name of the contact or group
+  name          String?
+  /// Number of unread messages (tracked locally)
+  unreadCount   Int       @default(0)
+  /// Timestamp of the most recent message in this chat
+  lastMessageAt DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  messages Message[]
+
+  @@map("chats")
+}
+
+// =============================================================================
+// Message — individual WhatsApp message record
+//
+// messageType values: TEXT | IMAGE | VIDEO | AUDIO | DOCUMENT | STICKER |
+//                     LOCATION | CONTACT | UNKNOWN
+// status values:      PENDING | SENT | DELIVERED | READ | FAILED
+// =============================================================================
+model Message {
+  /// Internal UUID
+  id             String   @id @default(uuid())
+  /// The Baileys-generated message ID (from WAMessage.key.id)
+  baileysId      String   @unique
+  /// The JID of the conversation this message belongs to
+  chatId         String
+  /// The remote JID (sender or recipient)
+  remoteJid      String
+  /// true if WE sent this message, false if it was received
+  fromMe         Boolean
+  /// Message content type (TEXT | IMAGE | VIDEO | AUDIO | DOCUMENT | STICKER | LOCATION | CONTACT | UNKNOWN)
+  messageType    String   @default("TEXT")
+  /// Text content (body of text messages or caption for media)
+  body           String?
+  /// Public URL if media came from a URL
+  mediaUrl       String?
+  /// Local filesystem path where downloaded media is stored
+  mediaLocalPath String?
+  /// MIME type for media messages
+  mimetype       String?
+  /// Original filename for documents
+  fileName       String?
+  /// Unix timestamp (seconds) from WhatsApp message metadata — stored as String to avoid BigInt JSON issues
+  timestamp      String
+  /// Delivery / read status (PENDING | SENT | DELIVERED | READ | FAILED)
+  status         String   @default("PENDING")
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  chat Chat @relation(fields: [chatId], references: [id])
+
+  @@index([chatId, timestamp])
+  @@index([baileysId])
+  @@map("messages")
+}
+
+// =============================================================================
+// MediaFile — tracks downloaded incoming media files stored locally
+// =============================================================================
+model MediaFile {
+  id           String   @id @default(uuid())
+  /// Unique filename on disk (UUID-based to avoid collisions)
+  filename     String   @unique
+  /// Original filename if available (e.g. document.pdf)
+  originalName String?
+  /// MIME type (e.g. "image/jpeg", "audio/ogg")
+  mimetype     String
+  /// File size in bytes
+  size         Int
+  /// Absolute local path to the stored file
+  localPath    String
+  createdAt    DateTime @default(now())
+
+  @@map("media_files")
+}
