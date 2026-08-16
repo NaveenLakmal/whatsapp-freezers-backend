@@ -18,6 +18,7 @@ RUN npx prisma generate
 
 # Copy source code and build production assets
 COPY . .
+RUN chmod +x ./docker-entrypoint.sh
 RUN npm run build
 
 # Expose default HTTP port
