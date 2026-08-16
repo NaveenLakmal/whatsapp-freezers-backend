@@ -8,26 +8,53 @@ if [ -f .env ]; then
   set +a
 fi
 
-# If DATABASE_URL is not set, but individual DATABASE_* variables are provided, assemble DATABASE_URL
-if [ -z "$DATABASE_URL" ] && [ -n "$DATABASE_HOST" ]; then
-  DB_PORT="${DATABASE_PORT:-5432}"
-  export DATABASE_URL="postgresql://${DATABASE_USER}:${DATABASE_PASSWORD}@${DATABASE_HOST}:${DB_PORT}/${DATABASE_NAME}?sslmode=require"
-  echo "[Startup] Constructed DATABASE_URL from DATABASE_HOST, DATABASE_USER, etc."
-fi
-
-# Trim any leading/trailing quotes that may have been accidentally copied in environment variables
+# Strip surrounding quotes if present
 if [ -n "$DATABASE_URL" ]; then
   DATABASE_URL=$(echo "$DATABASE_URL" | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
-  export DATABASE_URL
 fi
 
-if [ -z "$DATABASE_URL" ]; then
-  echo "================================================================================"
-  echo "[ERROR] DATABASE_URL is not set!"
-  echo "Please set DATABASE_URL or DATABASE_HOST in your Koyeb Environment Variables."
-  echo "================================================================================"
-  exit 1
-fi
+# If DATABASE_URL has unexpanded shell variables (e.g. literal ${DATABASE_USER}), clear it to trigger reconstruction
+case "$DATABASE_URL" in
+  *\$* )
+    echo "[Startup] DATABASE_URL contains unexpanded template variables (\$). Rebuilding..."
+    DATABASE_URL=""
+    ;;
+esac
+
+# If DATABASE_URL does not start with postgresql:// or postgres://, attempt reconstruction from individual vars
+case "$DATABASE_URL" in
+  postgresql://*|postgres://*)
+    # Valid protocol
+    ;;
+  *)
+    if [ -n "$DATABASE_HOST" ]; then
+      DB_PORT="${DATABASE_PORT:-5432}"
+      DATABASE_URL="postgresql://${DATABASE_USER}:${DATABASE_PASSWORD}@${DATABASE_HOST}:${DB_PORT}/${DATABASE_NAME}?sslmode=require"
+      echo "[Startup] Reconstructed DATABASE_URL from DATABASE_HOST, DATABASE_USER, DATABASE_PASSWORD, DATABASE_NAME."
+    fi
+    ;;
+esac
+
+export DATABASE_URL
+
+# Validate protocol before calling Prisma
+case "$DATABASE_URL" in
+  postgresql://*|postgres://*)
+    # Mask password when logging for security
+    SAFE_URL=$(echo "$DATABASE_URL" | sed -E 's/:([^@:]+)@/:****@/')
+    echo "[Startup] Using database URL: $SAFE_URL"
+    ;;
+  *)
+    echo "================================================================================"
+    echo "[ERROR] Invalid or missing DATABASE_URL!"
+    echo "Current DATABASE_URL: '$DATABASE_URL'"
+    echo "DATABASE_URL must start with 'postgresql://' or 'postgres://'."
+    echo "Please set DATABASE_URL in your Koyeb Environment Variables to:"
+    echo "postgresql://koyeb-adm:npg_UjuTIzriE58R@ep-crimson-shadow-a1mzygk8.ap-southeast-1.pg.koyeb.app:5432/whatappDBV2?sslmode=require"
+    echo "================================================================================"
+    exit 1
+    ;;
+esac
 
 echo "[Startup] Syncing database schema with Prisma..."
 npx prisma db push --skip-generate
