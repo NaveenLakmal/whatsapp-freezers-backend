@@ -5,14 +5,15 @@ WORKDIR /app
 # Install OpenSSL for Prisma engine compatibility on Alpine
 RUN apk add --no-cache openssl
 
-# Copy dependency definitions
+# Copy dependency definitions and Prisma schema
+# (prisma directory is required during `npm ci` because package.json runs `postinstall: prisma generate`)
 COPY package*.json ./
+COPY prisma ./prisma/
 
 # Install dependencies using clean install
 RUN npm ci
 
-# Copy Prisma schema and generate Prisma Client
-COPY prisma ./prisma
+# Explicitly ensure Prisma Client is generated
 RUN npx prisma generate
 
 # Copy source code and build production assets
