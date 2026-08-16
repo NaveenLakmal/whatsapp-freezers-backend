@@ -1,6 +1,9 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { useMultiFileAuthState, AuthenticationState } from '@whiskeysockets/baileys';
+import {
+  useMultiFileAuthState,
+  AuthenticationState,
+} from '@whiskeysockets/baileys';
 import { Logger } from '@nestjs/common';
 
 /**

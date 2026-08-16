@@ -1,4 +1,9 @@
-import { CanActivate, ExecutionContext, Injectable, Logger } from '@nestjs/common';
+import {
+  CanActivate,
+  ExecutionContext,
+  Injectable,
+  Logger,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { WsException } from '@nestjs/websockets';
 import { Socket } from 'socket.io';
@@ -32,7 +37,9 @@ export class WsApiKeyGuard implements CanActivate {
       (client.handshake.query?.apiKey as string | undefined);
 
     if (!key || key !== expected) {
-      this.logger.warn(`WebSocket connection rejected — invalid API key from ${client.handshake.address}`);
+      this.logger.warn(
+        `WebSocket connection rejected — invalid API key from ${client.handshake.address}`,
+      );
       throw new WsException('Invalid or missing API key.');
     }
 

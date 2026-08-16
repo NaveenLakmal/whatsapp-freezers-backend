@@ -35,7 +35,7 @@ const MessageType = {
   CONTACT: 'CONTACT',
   UNKNOWN: 'UNKNOWN',
 } as const;
-type MessageType = typeof MessageType[keyof typeof MessageType];
+type MessageType = (typeof MessageType)[keyof typeof MessageType];
 
 const MessageStatus = {
   PENDING: 'PENDING',
@@ -44,7 +44,7 @@ const MessageStatus = {
   READ: 'READ',
   FAILED: 'FAILED',
 } as const;
-type MessageStatus = typeof MessageStatus[keyof typeof MessageStatus];
+type MessageStatus = (typeof MessageStatus)[keyof typeof MessageStatus];
 
 // ---------------------------------------------------------------------------
 // Connection status type — shared with the rest of the application
@@ -116,8 +116,10 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
     private readonly prisma: PrismaService,
     private readonly events: EventEmitter2,
   ) {
-    this.authStateDir = this.config.get<string>('whatsapp.authStateDir') ?? './auth_state';
-    this.mediaUploadDir = this.config.get<string>('media.uploadDir') ?? './uploads';
+    this.authStateDir =
+      this.config.get<string>('whatsapp.authStateDir') ?? './auth_state';
+    this.mediaUploadDir =
+      this.config.get<string>('media.uploadDir') ?? './uploads';
     this.authStore = new BaileysAuthStore(this.authStateDir);
     this.ensureMediaDir();
   }
@@ -240,8 +242,6 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-
-
   /**
    * Handles WhatsApp connection state changes.
    */
@@ -277,9 +277,13 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
     if (connection === 'close') {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const reason =
-        DisconnectReason[statusCode as unknown as keyof typeof DisconnectReason] ?? 'Unknown';
+        DisconnectReason[
+          statusCode as unknown as keyof typeof DisconnectReason
+        ] ?? 'Unknown';
 
-      this.logger.warn(`Connection closed. Status: ${statusCode}, Reason: ${reason}`);
+      this.logger.warn(
+        `Connection closed. Status: ${statusCode}, Reason: ${reason}`,
+      );
       this.setConnectionInfo({ status: 'close' });
 
       const isLoggedOut = statusCode === DisconnectReason.loggedOut;
@@ -336,7 +340,9 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
         await this.persistMessage(msg);
       } catch (err) {
         // Log error without message content for privacy in production
-        this.logger.error(`Failed to persist message [id=${msg.key.id}]: ${(err as Error).message}`);
+        this.logger.error(
+          `Failed to persist message [id=${msg.key.id}]: ${(err as Error).message}`,
+        );
       }
     }
   }
@@ -357,7 +363,8 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
     const timestamp = String(
       typeof msg.messageTimestamp === 'number'
         ? msg.messageTimestamp
-        : (msg.messageTimestamp as any)?.toNumber?.() ?? Math.floor(Date.now() / 1000),
+        : ((msg.messageTimestamp as any)?.toNumber?.() ??
+            Math.floor(Date.now() / 1000)),
     );
 
     // Upsert the chat record
@@ -374,7 +381,11 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
       messageType !== MessageType.UNKNOWN &&
       msg.message
     ) {
-      mediaLocalPath = await this.downloadAndStoreMedia(msg, messageType, mimetype);
+      mediaLocalPath = await this.downloadAndStoreMedia(
+        msg,
+        messageType,
+        mimetype,
+      );
     }
 
     // Upsert to avoid duplicates on reconnect replays
@@ -435,11 +446,11 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
 
       let status: MessageStatus | null = null;
       if (statusNum === proto.WebMessageInfo.Status.DELIVERY_ACK) {
-        status = MessageStatus.DELIVERED as MessageStatus;
+        status = MessageStatus.DELIVERED;
       } else if (statusNum === proto.WebMessageInfo.Status.READ) {
-        status = MessageStatus.READ as MessageStatus;
+        status = MessageStatus.READ;
       } else if (statusNum === proto.WebMessageInfo.Status.ERROR) {
-        status = MessageStatus.FAILED as MessageStatus;
+        status = MessageStatus.FAILED;
       }
 
       if (!status) continue;
@@ -451,7 +462,7 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
         });
 
         this.events.emit('message.status', { baileysId, status });
-      } catch (err) {
+      } catch {
         this.logger.error(`Failed to update message status [id=${baileysId}]`);
       }
     }
@@ -476,7 +487,7 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
             unreadCount: chat.unreadCount ?? undefined,
           },
         });
-      } catch (err) {
+      } catch {
         this.logger.error(`Failed to upsert chat [jid=${chat.id}]`);
       }
     }
@@ -499,10 +510,11 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async upsertChat(jid: string, msg: WAMessage): Promise<void> {
-    const ts = typeof msg.messageTimestamp === 'number'
-      ? msg.messageTimestamp
-      : (msg.messageTimestamp as any)?.toNumber?.() ?? Math.floor(Date.now() / 1000);
-    const timestamp = String(ts);
+    const ts =
+      typeof msg.messageTimestamp === 'number'
+        ? msg.messageTimestamp
+        : ((msg.messageTimestamp as any)?.toNumber?.() ??
+          Math.floor(Date.now() / 1000));
     const lastMessageAt = new Date(ts * 1000);
 
     await this.prisma.chat.upsert({
@@ -515,9 +527,7 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
       },
       update: {
         lastMessageAt,
-        unreadCount: msg.key.fromMe
-          ? undefined
-          : { increment: 1 },
+        unreadCount: msg.key.fromMe ? undefined : { increment: 1 },
       },
     });
   }
@@ -611,21 +621,23 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
       const ext = this.mimetypeToExtension(mimetype ?? '', type);
       const filename = `${crypto.randomUUID()}${ext}`;
       const filePath = path.join(this.mediaUploadDir, filename);
-      fs.writeFileSync(filePath, buffer as Buffer);
+      fs.writeFileSync(filePath, buffer);
 
       // Store media file metadata
       await this.prisma.mediaFile.create({
         data: {
           filename,
           mimetype: mimetype ?? 'application/octet-stream',
-          size: (buffer as Buffer).length,
+          size: buffer.length,
           localPath: filePath,
         },
       });
 
       return filePath;
     } catch (err) {
-      this.logger.error(`Failed to download media for message: ${(err as Error).message}`);
+      this.logger.error(
+        `Failed to download media for message: ${(err as Error).message}`,
+      );
       return undefined;
     }
   }
@@ -658,7 +670,10 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
    * PRESENCE NOTE: sendPresenceUpdate('composing') is intentionally NOT
    * called before or after sending. The typing indicator will NOT appear.
    */
-  async sendTextMessage(jid: string, text: string): Promise<WAMessage | undefined> {
+  async sendTextMessage(
+    jid: string,
+    text: string,
+  ): Promise<WAMessage | undefined> {
     this.ensureConnected();
 
     // ── PRESENCE: composing update intentionally NOT sent ─────────────────
@@ -694,7 +709,7 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
     // ─────────────────────────────────────────────────────────────────────
 
     const result = await this.sock!.sendMessage(jid, {
-      image: image as any,
+      image: image,
       caption: caption ?? '',
     });
 
@@ -855,9 +870,12 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
       trace: () => {},
       debug: () => {},
       info: () => {},
-      warn: (data: any, msg?: string) => this.logger.warn(msg ?? JSON.stringify(data)),
-      error: (data: any, msg?: string) => this.logger.error(msg ?? JSON.stringify(data)),
-      fatal: (data: any, msg?: string) => this.logger.fatal?.(msg ?? JSON.stringify(data)),
+      warn: (data: any, msg?: string) =>
+        this.logger.warn(msg ?? JSON.stringify(data)),
+      error: (data: any, msg?: string) =>
+        this.logger.error(msg ?? JSON.stringify(data)),
+      fatal: (data: any, msg?: string) =>
+        this.logger.fatal?.(msg ?? JSON.stringify(data)),
       child: () => this.createBaileysLogger(),
     };
   }

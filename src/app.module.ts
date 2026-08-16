@@ -10,6 +10,9 @@ import { ConnectionModule } from './connection/connection.module';
 import { EventsModule } from './events/events.module';
 import { MediaModule } from './media/media.module';
 
+import { AppController } from './app.controller';
+import { AppService } from './app.service';
+
 @Module({
   imports: [
     // ── Config ────────────────────────────────────────────────────────────
@@ -44,5 +47,7 @@ import { MediaModule } from './media/media.module';
     EventsModule,
     MediaModule,
   ],
+  controllers: [AppController],
+  providers: [AppService],
 })
 export class AppModule {}

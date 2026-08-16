@@ -59,20 +59,23 @@ report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 # WhatsApp Backend — Project-specific ignores
 # =============================================================================
 
-# Baileys auth state — contains WhatsApp session credentials (NEVER commit)
+# Baileys authentication / session directories (NEVER commit credentials)
+auth_info_baileys/
+auth_info/
+baileys_auth_info/
+auth_state/
 /auth_state/
 
 # Downloaded media files from WhatsApp
 /uploads/
+uploads/
 
-# SQLite database files
+# SQLite database & journal files
 *.db
+*.db-journal
 *.db-shm
 *.db-wal
 
-# Keep .env tracked as a template (values are placeholders)
-# Uncomment the line below if you want to exclude it entirely:
-# .env
+# Prisma generated client
+node_modules/.prisma
 
-# Prisma generated client (regenerated via postinstall)
-# node_modules/@prisma/client is already covered by /node_modules above

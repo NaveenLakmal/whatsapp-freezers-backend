@@ -5,7 +5,7 @@ import {
   WebSocketGateway,
   WebSocketServer,
 } from '@nestjs/websockets';
-import { Logger, UseGuards } from '@nestjs/common';
+import { Logger } from '@nestjs/common';
 import { Server, Socket } from 'socket.io';
 import { OnEvent } from '@nestjs/event-emitter';
 import { WsApiKeyGuard } from '../auth/ws-auth.guard';
@@ -39,10 +39,11 @@ import type { ConnectionInfo } from '../whatsapp/whatsapp.service';
  */
 @WebSocketGateway({
   cors: {
-    origin: '*', // Restrict to your Flutter app's origin in production
-    credentials: true,
+    origin: '*',
+    credentials: false,
   },
   namespace: '/',
+  transports: ['websocket', 'polling'],
 })
 export class EventsGateway
   implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect
@@ -80,7 +81,9 @@ export class EventsGateway
       return;
     }
 
-    this.logger.log(`WS client connected: ${client.id} from ${client.handshake.address}`);
+    this.logger.log(
+      `WS client connected: ${client.id} from ${client.handshake.address}`,
+    );
   }
 
   handleDisconnect(client: Socket): void {

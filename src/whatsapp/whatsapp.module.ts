@@ -1,6 +1,5 @@
 import { Module } from '@nestjs/common';
 import { WhatsAppService } from './whatsapp.service';
-import { EventEmitterModule } from '@nestjs/event-emitter';
 
 @Module({
   imports: [

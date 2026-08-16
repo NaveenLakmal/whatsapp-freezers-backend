@@ -44,15 +44,23 @@ async function bootstrap() {
     next();
   });
 
+  // ── Graceful Shutdown Hooks ──────────────────────────────────────────────
+  // Ensures NestJS triggers onModuleDestroy hooks (closing DB, Baileys socket,
+  // Socket.io connections) when SIGTERM/SIGINT is received from Docker / Koyeb.
+  app.enableShutdownHooks();
+
   // ── Global Prefix ─────────────────────────────────────────────────────────
   app.setGlobalPrefix('api/v1');
 
-  const port = process.env.PORT ?? 3000;
-  await app.listen(port);
+  const port = process.env.PORT || 3000;
+  await app.listen(port, '0.0.0.0');
 
-  logger.log(`🚀 WhatsApp Backend running on: http://localhost:${port}/api/v1`);
-  logger.log(`📡 WebSocket gateway at: ws://localhost:${port}`);
-  logger.log(`📷 Scan QR code at: GET http://localhost:${port}/api/v1/connection/qr`);
+  logger.log(`🚀 WhatsApp Backend running on: http://0.0.0.0:${port}/api/v1`);
+  logger.log(`📡 WebSocket gateway at: ws://0.0.0.0:${port}`);
+  logger.log(
+    `📷 Scan QR code at: GET http://0.0.0.0:${port}/api/v1/connection/qr`,
+  );
+  logger.log(`💓 Health check at: GET http://0.0.0.0:${port}/health`);
 }
 
 void bootstrap();

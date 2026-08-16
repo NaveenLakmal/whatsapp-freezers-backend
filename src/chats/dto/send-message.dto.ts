@@ -1,4 +1,4 @@
-import { IsNotEmpty, IsOptional, IsString, IsIn } from 'class-validator';
+import { IsOptional, IsString, IsIn } from 'class-validator';
 
 /**
  * DTO for POST /chats/:jid/messages

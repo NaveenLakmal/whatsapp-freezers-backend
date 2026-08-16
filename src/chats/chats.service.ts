@@ -65,20 +65,28 @@ export class ChatsService {
     try {
       if (type === 'text') {
         if (!dto.text?.trim()) {
-          throw new NotFoundException('Text content is required for text messages.');
+          throw new NotFoundException(
+            'Text content is required for text messages.',
+          );
         }
         await this.whatsapp.sendTextMessage(jid, dto.text);
       } else if (type === 'image') {
-        if (!dto.mediaUrl) throw new NotFoundException('mediaUrl is required for image messages.');
+        if (!dto.mediaUrl)
+          throw new NotFoundException(
+            'mediaUrl is required for image messages.',
+          );
         await this.whatsapp.sendImageMessage(
           jid,
           { url: dto.mediaUrl },
           dto.text,
         );
       } else {
-        if (!dto.mediaUrl) throw new NotFoundException('mediaUrl is required for media messages.');
+        if (!dto.mediaUrl)
+          throw new NotFoundException(
+            'mediaUrl is required for media messages.',
+          );
         await this.whatsapp.sendMediaMessage(jid, {
-          type: type as 'video' | 'audio' | 'document',
+          type: type,
           media: { url: dto.mediaUrl },
           caption: dto.text,
           mimetype: dto.mimetype,
@@ -90,7 +98,8 @@ export class ChatsService {
       // WhatsApp not connected — surface a clean error
       const { ServiceUnavailableException } = await import('@nestjs/common');
       throw new ServiceUnavailableException(
-        (err as Error).message ?? 'WhatsApp is not connected. Scan the QR at GET /connection/qr first.',
+        (err as Error).message ??
+          'WhatsApp is not connected. Scan the QR at GET /connection/qr first.',
       );
     }
 

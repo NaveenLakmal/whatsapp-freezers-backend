@@ -17,9 +17,12 @@ export default () => ({
   whatsapp: {
     /**
      * Directory where Baileys stores multi-file auth state (credentials,
-     * keys, etc.). Must persist across restarts to avoid re-scanning the QR.
+     * keys, etc.). Configurable via BAILEYS_AUTH_DIR or AUTH_STATE_DIR.
      */
-    authStateDir: process.env.AUTH_STATE_DIR ?? './auth_state',
+    authStateDir:
+      process.env.BAILEYS_AUTH_DIR ??
+      process.env.AUTH_STATE_DIR ??
+      './auth_state',
   },
 
   media: {

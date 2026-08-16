@@ -1,53 +1,64 @@
 # WhatsApp Chat Backend
 
-A NestJS backend that connects to WhatsApp via the [Baileys](https://github.com/WhiskeySockets/Baileys) multi-device library and exposes a REST API + Socket.io WebSocket interface for a Flutter mobile app to send and receive messages.
+A production-ready NestJS backend that connects to WhatsApp via the [@whiskeysockets/baileys](https://github.com/WhiskeySockets/Baileys) multi-device library. It exposes a REST API and a Socket.io WebSocket interface designed to be consumed by Flutter mobile/desktop applications.
 
 ---
 
 ## 🔒 Privacy-First Design
 
-This backend is built with a strict **no-presence** policy:
+This backend enforces a strict **no-presence** policy:
 
-- ❌ `sendPresenceUpdate()` is **never** called — your "last seen" and "online" status are never updated
-- ❌ `presenceSubscribe()` is **never** called
-- ❌ Read receipts are **never** sent automatically — only via an explicit opt-in endpoint
-- ✅ The Baileys socket is initialized with `markOnlineOnConnect: false`
-- Every place in the codebase where these calls could appear has a `// PRESENCE: intentionally not called` comment
+* ❌ `sendPresenceUpdate()` is **never** called — your "last seen" and "online" statuses are not intentionally broadcast.
+* ❌ `presenceSubscribe()` is **never** called.
+* ❌ Read receipts are **never** sent automatically upon receiving messages.
+* ⚠️ `POST /chats/:jid/read` is the only read-receipt trigger and is purely opt-in.
+* ✅ The Baileys socket is initialized with `markOnlineOnConnect: false`.
+
+> **Note:** The backend avoids sending intentional presence updates; server-side behavior is managed strictly according to Baileys and WhatsApp protocol defaults.
 
 ---
 
 ## Tech Stack
 
 | Layer | Technology |
-|-------|-----------|
+|---|---|
 | Framework | NestJS 11 (TypeScript) |
-| WhatsApp | `@whiskeysockets/baileys` |
-| Database | Prisma 5 + SQLite (dev) / PostgreSQL (prod) |
-| WebSocket | `@nestjs/websockets` + Socket.io |
-| Auth | Static API Key (`x-api-key` header) |
+| WhatsApp Engine | `@whiskeysockets/baileys` |
+| ORM & Database | Prisma 5 with SQLite (dev/container) or PostgreSQL |
+| Real-Time Communication | `@nestjs/websockets` + Socket.io |
+| Authentication | Static API Key (`x-api-key` header & WS handshake) |
 | Validation | `class-validator` + `class-transformer` |
+| Containerization | Docker (Node 22 LTS Alpine) |
 
 ---
 
 ## Project Structure
 
 ```
-src/
-├── config/            # Typed environment configuration
-├── auth/              # API key guards (REST + WebSocket)
-├── whatsapp/          # Core Baileys integration (WhatsAppService)
-├── chats/             # REST endpoints for chats & messages
-├── connection/        # REST endpoints for connection status & QR
-├── events/            # Socket.io WebSocket gateway
-├── media/             # Media file serving
-└── prisma/            # Prisma service (global)
-prisma/
-└── schema.prisma      # Chat, Message, MediaFile models
+├── Dockerfile                 # Production multi-step Alpine Dockerfile
+├── .dockerignore              # Docker build exclusions
+├── .env.example               # Template for environment variables
+├── .gitignore                 # Git ignore (auth credentials, DBs, logs)
+├── prisma/
+│   └── schema.prisma          # Prisma models (Chat, Message, MediaFile)
+├── src/
+│   ├── app.controller.ts      # Health check and root endpoints
+│   ├── app.module.ts          # Core application module
+│   ├── auth/                  # REST and WebSocket API key guards
+│   ├── chats/                 # REST endpoints for chats and messages
+│   ├── config/                # Typed configuration schema
+│   ├── connection/            # WhatsApp connection & QR management
+│   ├── events/                # Socket.io gateway for real-time events
+│   ├── main.ts                # Bootstrap, CORS, graceful shutdown hooks
+│   ├── media/                 # Local media file storage & streaming
+│   ├── prisma/                # Prisma client service
+│   └── whatsapp/              # Baileys WhatsApp service & auth store
+└── uploads/                   # Stored media files (ignored in git)
 ```
 
 ---
 
-## Setup
+## Local Development
 
 ### 1. Install Dependencies
 
@@ -55,192 +66,183 @@ prisma/
 npm install
 ```
 
-> The `postinstall` script automatically regenerates the Prisma client.
-
 ### 2. Configure Environment
 
-Copy `.env` and update values:
+Copy `.env.example` to `.env` and fill in your settings:
 
 ```bash
-cp .env .env.local   # optional — .env is already pre-filled with defaults
+cp .env.example .env
 ```
 
-Edit `.env`:
-
+Example `.env`:
 ```env
 PORT=3000
-API_KEY=change-me-to-a-strong-random-secret   # ← CHANGE THIS
-DATABASE_URL="file:./dev.db"
-AUTH_STATE_DIR=./auth_state
-MEDIA_UPLOAD_DIR=./uploads
 NODE_ENV=development
+API_KEY=change-me-to-a-strong-random-secret
+DATABASE_URL="file:./dev.db"
+BAILEYS_AUTH_DIR=./auth_state
+MEDIA_UPLOAD_DIR=./uploads
 ```
 
-> ⚠️ **Security**: Set `API_KEY` to a long random string. All REST and WebSocket endpoints require this key.
-
-### 3. Run Database Migration
+### 3. Generate Prisma Client & Migrate
 
 ```bash
+npx prisma generate
 npx prisma migrate dev --name init
 ```
 
-This creates `dev.db` (SQLite) with the Chat, Message, and MediaFile tables.
-
-### 4. Start the Server
+### 4. Run the Dev Server
 
 ```bash
-# Development (hot reload)
 npm run start:dev
+```
 
-# Production
+The server listens on `http://localhost:3000/api/v1` and WebSocket at `ws://localhost:3000`.
+
+---
+
+## Production Build & Run
+
+```bash
+# Build TypeScript bundle
 npm run build
+
+# Start production server
 npm run start:prod
 ```
 
-Server starts at: `http://localhost:3000/api/v1`
+---
 
-### 5. Scan the QR Code (First Run)
+## Docker
 
-On first launch, open in your browser or `curl`:
-
-```
-GET http://localhost:3000/api/v1/connection/qr
-x-api-key: your-api-key-here
-```
-
-The response contains a base64 PNG QR code. Display it, scan with WhatsApp on your phone, and the connection becomes permanent (credentials are saved in `./auth_state/`).
-
-**Terminal shortcut** — poll until connected:
+### Build Docker Image
 
 ```bash
-watch -n 2 'curl -s -H "x-api-key: your-api-key" http://localhost:3000/api/v1/connection/status | python3 -m json.tool'
+docker build -t whatsapp-freezers-backend .
+```
+
+### Run Docker Container Locally
+
+```bash
+docker run -d \
+  -p 3000:3000 \
+  --name whatsapp-backend \
+  -e PORT=3000 \
+  -e NODE_ENV=production \
+  -e API_KEY=your-strong-api-key \
+  -e DATABASE_URL="file:./dev.db" \
+  -e BAILEYS_AUTH_DIR=/app/auth_state \
+  -e MEDIA_UPLOAD_DIR=/app/uploads \
+  whatsapp-freezers-backend
 ```
 
 ---
 
-## REST API Reference
+## 🚀 Deploying to Koyeb
 
-All endpoints require the `x-api-key: <API_KEY>` header.
+Follow these steps to deploy on [Koyeb](https://www.koyeb.com):
 
-Base URL: `http://localhost:3000/api/v1`
+1. **Push your repository to GitHub** (make sure `.env` and any auth folders are NOT committed).
+2. Go to the **Koyeb Control Panel** and click **Create App** or **Create Service**.
+3. Select **GitHub** as the deployment source and pick your repository.
+4. Set the **Builder** to `Dockerfile`.
+5. Under **Environment Variables**, configure:
+   * `NODE_ENV`: `production`
+   * `PORT`: `3000` (or leave default if Koyeb injects `PORT`)
+   * `API_KEY`: `<Your-Strong-Secret-Key>`
+   * `DATABASE_URL`: `file:./dev.db` (or your PostgreSQL connection string)
+   * `BAILEYS_AUTH_DIR`: `./auth_state`
+   * `MEDIA_UPLOAD_DIR`: `./uploads`
+6. Under **Ports / Expose**:
+   * Port: `3000` (or the configured `PORT`)
+   * Protocol: `HTTP`
+   * Public: Enabled (Path: `/`)
+7. Under **Health Checks**:
+   * Type: `HTTP`
+   * Path: `/health`
+8. Click **Deploy**.
+9. Verify health status:
+   ```bash
+   curl https://<your-koyeb-app-name>.koyeb.app/health
+   ```
+   Expected response: `{"status":"ok"}`
+10. Check WhatsApp connection status & scan QR:
+    * Check status:
+      ```bash
+      curl -H "x-api-key: <your-api-key>" https://<your-koyeb-app-name>.koyeb.app/api/v1/connection/status
+      ```
+    * Open browser view to link WhatsApp:
+      ```
+      https://<your-koyeb-app-name>.koyeb.app/api/v1/connection/qr-view?apiKey=<your-api-key>
+      ```
 
-### Connection
+---
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/connection/status` | Current WhatsApp connection state |
-| `GET` | `/connection/qr` | QR code as base64 PNG (when not authenticated) |
-| `DELETE` | `/connection/logout` | Log out and clear session |
+## ⚠️ WhatsApp Session Persistence Notice (Koyeb & Containers)
 
-**Status response:**
-```json
-{ "status": "open", "updatedAt": "2024-01-01T10:00:00.000Z" }
-```
+> [!IMPORTANT]
+> **Stateless Container Lifecycles:**
+> Standard Koyeb containers are stateless. Any session files written to local container directories (e.g. `./auth_state` or `./auth_info_baileys`) will be lost when a container is redeployed, rebuilt, or restarted onto a new instance.
+>
+> **Production Recommendation for Permanent Sessions:**
+> 1. Attach a **Koyeb Persistent Volume** to `/app/auth_state` and set `BAILEYS_AUTH_DIR=/app/auth_state`.
+> 2. Or, use a managed database (such as PostgreSQL) for persistent data and an external storage volume for auth state.
 
-**Status values:** `connecting` · `open` · `close` · `qr`
+---
 
-### Chats
+## API Contract Reference
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/chats` | List all conversations |
-| `GET` | `/chats/:jid/messages?limit=50&offset=0` | Paginated message history |
-| `POST` | `/chats/:jid/messages` | Send a message |
-| `POST` | `/chats/:jid/read` | ⚠️ Mark chat as read (sends read receipts — opt-in only) |
+All endpoints except `/health` and `/` require the `x-api-key: <API_KEY>` header (or `?apiKey=<API_KEY>` query param).
 
-**Send text message:**
-```json
-POST /api/v1/chats/1234567890@s.whatsapp.net/messages
-{ "type": "text", "text": "Hello from the API!" }
-```
+### Public Endpoints
 
-**Send image by URL:**
-```json
-POST /api/v1/chats/1234567890@s.whatsapp.net/messages
-{
-  "type": "image",
-  "mediaUrl": "https://example.com/photo.jpg",
-  "text": "Optional caption"
-}
-```
+| Method | Path | Description | Authentication |
+|---|---|---|---|
+| `GET` | `/health` or `/api/v1/health` | Health check probe | Public |
+| `GET` | `/` or `/api/v1` | Service info | Public |
 
-**Send document:**
-```json
-{
-  "type": "document",
-  "mediaUrl": "https://example.com/report.pdf",
-  "fileName": "report.pdf",
-  "mimetype": "application/pdf"
-}
-```
+### WhatsApp Connection
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/v1/connection/status` | Connection status (`connecting` \| `open` \| `close` \| `qr`) |
+| `GET` | `/api/v1/connection/qr` | Base64 QR code PNG payload |
+| `GET` | `/api/v1/connection/qr-view` | Browser webpage with auto-refreshing QR |
+| `DELETE` | `/api/v1/connection/logout` | Disconnect and clear credentials |
+
+### Chats & Messages
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/v1/chats` | List all conversations |
+| `GET` | `/api/v1/chats/:jid/messages` | Paginated message history (`?limit=50&offset=0`) |
+| `POST` | `/api/v1/chats/:jid/messages` | Send message (text, image, audio, doc) |
+| `POST` | `/api/v1/chats/:jid/read` | Explicitly mark messages as read |
 
 ### Media
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/media/:filename` | Stream a stored media file |
-| `GET` | `/media?limit=50&offset=0` | List stored media metadata |
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/v1/media/:filename` | Stream stored media attachment |
+| `GET` | `/api/v1/media` | List media files metadata |
 
 ---
 
-## WebSocket (Socket.io)
+## Real-Time WebSocket (Socket.io)
 
-Connect from Flutter:
+Flutter apps connect to the root URL using Socket.io client:
 
 ```dart
-// Option A — auth object (recommended)
-final socket = io('http://localhost:3000', OptionBuilder()
+import 'package:socket_io_client/socket_io_client.dart' as IO;
+
+final socket = IO.io('https://<your-koyeb-app>.koyeb.app', IO.OptionBuilder()
+  .setTransports(['websocket', 'polling'])
   .setAuth({'apiKey': 'your-api-key'})
+  .enableAutoConnect()
   .build());
 
-// Option B — query param
-final socket = io('http://localhost:3000?apiKey=your-api-key', ...);
+socket.onConnect((_) => print('Connected to WS'));
+socket.on('connection.status', (data) => print('Status: $data'));
+socket.on('message.new', (data) => print('New message: $data'));
+socket.on('message.status', (data) => print('Message status update: $data'));
 ```
-
-### Events Emitted by Server
-
-| Event | Description | Payload |
-|-------|-------------|---------|
-| `message.new` | New incoming or outgoing message | `{ id, baileysId, chatId, remoteJid, fromMe, messageType, body, mediaUrl, mediaLocalPath, mimetype, fileName, timestamp, status }` |
-| `connection.status` | WhatsApp connection state changed | `{ status: 'open'\|'close'\|'connecting'\|'qr', qr?, updatedAt }` |
-| `message.status` | Delivery/read status update | `{ baileysId, status: 'DELIVERED'\|'READ'\|'FAILED' }` |
-
----
-
-## Switching to PostgreSQL
-
-1. Update `DATABASE_URL` in `.env`:
-   ```
-   DATABASE_URL="postgresql://user:password@localhost:5432/whatsapp_db"
-   ```
-2. Change `provider` in `prisma/schema.prisma`:
-   ```
-   provider = "postgresql"
-   ```
-3. Re-run migration:
-   ```bash
-   npx prisma migrate dev --name init
-   ```
-
-No other code changes needed.
-
----
-
-## Useful Commands
-
-```bash
-npm run start:dev        # Start with hot reload
-npm run build            # Compile TypeScript
-npm run prisma:migrate   # Run pending migrations
-npm run prisma:studio    # Open Prisma Studio (DB browser)
-npx prisma migrate reset # Reset & reseed DB (dev only)
-```
-
----
-
-## Security Notes
-
-- Never commit `.env` to version control (it's in `.gitignore`)
-- Never commit `auth_state/` — it contains your WhatsApp session credentials
-- Set `CORS origin` in `src/main.ts` to your Flutter app's specific origin in production
-- Rotate `API_KEY` if you suspect it has been compromised — all sessions using it will be invalid
