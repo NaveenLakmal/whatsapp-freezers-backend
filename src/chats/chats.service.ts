@@ -13,9 +13,18 @@ export class ChatsService {
 
   /**
    * Returns all known chats, ordered by most recent message first.
+   *
+   * ── BUG 1: displayName resolution ────────────────────────────────────────
+   * Each chat result includes a `displayName` field resolved in this priority:
+   *   1. contact.name        — from the user's saved address book (most trusted)
+   *   2. contact.pushName    — sender-supplied name (fallback, untrusted)
+   *   3. formatJidFallback() — strips "@s.whatsapp.net", e.g. "94789418306"
+   *
+   * The raw `jid` is NEVER used directly as a display title in the UI.
+   * ─────────────────────────────────────────────────────────────────────────
    */
   async getChats() {
-    return this.prisma.chat.findMany({
+    const chats = await this.prisma.chat.findMany({
       orderBy: { lastMessageAt: 'desc' },
       include: {
         _count: {
@@ -23,11 +32,39 @@ export class ChatsService {
         },
       },
     });
+
+    if (chats.length === 0) return [];
+
+    // Batch-fetch contacts for all chat JIDs in a single query
+    const jids = chats.map((c) => c.id);
+    const contacts = await this.prisma.contact.findMany({
+      where: { jid: { in: jids } },
+      select: { jid: true, name: true, pushName: true, imgUrl: true },
+    });
+
+    const contactMap = new Map(contacts.map((c) => [c.jid, c]));
+
+    return chats.map((chat) => {
+      const contact = contactMap.get(chat.id);
+      const displayName =
+        contact?.name ??
+        contact?.pushName ??
+        WhatsAppService.formatJidFallback(chat.id);
+
+      return {
+        ...chat,
+        displayName,
+        avatarUrl: contact?.imgUrl ?? null,
+      };
+    });
   }
 
   /**
    * Returns paginated messages for a specific chat JID.
    * Ordered newest-first for easy append-on-scroll in the Flutter app.
+   *
+   * Each message includes `wasViewOnce` so the Flutter UI can render a
+   * "view once" badge on media that was originally ephemeral.
    */
   async getMessages(jid: string, pagination: PaginationDto) {
     const chat = await this.prisma.chat.findUnique({ where: { id: jid } });
@@ -49,6 +86,10 @@ export class ChatsService {
         ...m,
         // BigInt is not JSON-serializable — convert to string
         timestamp: m.timestamp.toString(),
+        // senderJid: who sent this message (useful for group chat UI)
+        senderJid: m.senderJid ?? null,
+        // wasViewOnce: true if this was originally a view-once media message
+        wasViewOnce: m.wasViewOnce,
       })),
       total,
       limit: pagination.limit ?? 50,

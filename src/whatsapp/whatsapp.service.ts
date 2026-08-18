@@ -13,6 +13,7 @@ import makeWASocket, {
   downloadMediaMessage,
   fetchLatestBaileysVersion,
   isJidBroadcast,
+  isJidGroup,
   proto,
 } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
@@ -45,6 +46,22 @@ const MessageStatus = {
   FAILED: 'FAILED',
 } as const;
 type MessageStatus = (typeof MessageStatus)[keyof typeof MessageStatus];
+
+// Name source priority constants — controls which source may overwrite which.
+// Priority order (highest → lowest): contact > group_subject > pushName
+const NameSource = {
+  CONTACT: 'contact',
+  GROUP_SUBJECT: 'group_subject',
+  PUSH_NAME: 'pushName',
+} as const;
+type NameSource = (typeof NameSource)[keyof typeof NameSource];
+
+// Numeric priority map — higher wins.
+const NAME_SOURCE_PRIORITY: Record<string, number> = {
+  [NameSource.CONTACT]: 3,
+  [NameSource.GROUP_SUBJECT]: 2,
+  [NameSource.PUSH_NAME]: 1,
+};
 
 // ---------------------------------------------------------------------------
 // Connection status type — shared with the rest of the application
@@ -110,6 +127,7 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
 
   private readonly authStateDir: string;
   private readonly mediaUploadDir: string;
+  private readonly saveViewOnceMedia: boolean;
 
   constructor(
     private readonly config: ConfigService,
@@ -120,6 +138,8 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
       this.config.get<string>('whatsapp.authStateDir') ?? './auth_state';
     this.mediaUploadDir =
       this.config.get<string>('media.uploadDir') ?? './uploads';
+    this.saveViewOnceMedia =
+      this.config.get<boolean>('media.saveViewOnceMedia') ?? true;
     this.authStore = new BaileysAuthStore(this.authStateDir);
     this.ensureMediaDir();
   }
@@ -150,6 +170,11 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
    * Registers all event listeners and handles credential persistence.
    */
   async connect(): Promise<void> {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
     const { state, saveCreds } = await this.authStore.getAuthState();
     const { version } = await fetchLatestBaileysVersion();
 
@@ -240,6 +265,28 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
     this.sock.ev.on('chats.update', (updates) => {
       void this.handleChatsUpdate(updates);
     });
+
+    // ── BUG 1: Contact name resolution ───────────────────────────────────
+    // Listen for contact sync events from Baileys. These carry the user's
+    // own saved address-book names — the highest-trust name source.
+    this.sock.ev.on('contacts.upsert', (contacts) => {
+      void this.handleContactsUpsert(contacts);
+    });
+
+    this.sock.ev.on('contacts.update', (updates) => {
+      void this.handleContactsUpdate(updates);
+    });
+
+    // ── BUG 1: Group name resolution ─────────────────────────────────────
+    // Group subjects (names) come from these events and are stored in the
+    // Contact table under nameSource='group_subject'.
+    this.sock.ev.on('groups.upsert', (groups) => {
+      void this.handleGroupsUpsert(groups);
+    });
+
+    this.sock.ev.on('groups.update', (updates) => {
+      void this.handleGroupsUpdate(updates);
+    });
   }
 
   /**
@@ -289,11 +336,17 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
       const isLoggedOut = statusCode === DisconnectReason.loggedOut;
 
       if (isLoggedOut) {
-        this.logger.error(
-          'Logged out from WhatsApp. Auth state cleared. Re-scan QR to reconnect.',
+        this.logger.warn(
+          'Logged out from WhatsApp. Auth state cleared. Restarting connection to generate a new QR code...',
         );
         this.authStore.clearAuthState();
-        // Do not reconnect — wait for the user to trigger a new QR scan
+        this.reconnectAttempts = 0;
+        if (!this.isShuttingDown) {
+          // Restart connection after 1.5s so Baileys generates a fresh QR code
+          this.reconnectTimer = setTimeout(() => {
+            void this.connect();
+          }, 1500);
+        }
       } else if (!this.isShuttingDown) {
         // Any other disconnect reason — auto-reconnect with exponential backoff
         this.scheduleReconnect();
@@ -349,6 +402,15 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
 
   /**
    * Persists a WhatsApp message to the database and emits a WebSocket event.
+   *
+   * ── BUG 2 FIX: Chat grouping key ─────────────────────────────────────────
+   * The CHAT a message belongs to is ALWAYS determined by msg.key.remoteJid.
+   * - For group messages: remoteJid is the group JID (ending in @g.us)
+   * - For 1:1 messages:  remoteJid is the contact JID (@s.whatsapp.net)
+   *
+   * msg.key.participant is ONLY used to record WHO sent the message within
+   * a group (stored as senderJid). It is NEVER used as the chatId.
+   * ─────────────────────────────────────────────────────────────────────────
    */
   private async persistMessage(msg: WAMessage): Promise<void> {
     const jid = msg.key.remoteJid;
@@ -367,25 +429,49 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
             Math.floor(Date.now() / 1000)),
     );
 
-    // Upsert the chat record
+    // ── BUG 2: senderJid — WHO sent the message (not used as chatId) ──────
+    // For group messages: msg.key.participant holds the sender's JID
+    // For 1:1 messages:  participant is undefined; sender is remoteJid itself
+    const senderJid = fromMe
+      ? 'me'
+      : (msg.key.participant ?? jid);
+
+    // Upsert the chat record — always keyed by remoteJid (jid), never by participant
     await this.upsertChat(jid, msg);
 
-    // Extract message content
-    const { messageType, body, mediaUrl, mimetype, fileName } =
+    // ── BUG 1: Capture pushName as a low-priority fallback display name ───
+    // pushName is sent by the remote party and is UNTRUSTED — it must never
+    // overwrite a name that came from the user's own contact list.
+    if (msg.pushName && !fromMe) {
+      // For group messages, update the sender's contact entry (not the group)
+      const contactJid = msg.key.participant ?? jid;
+      await this.upsertContactPushName(contactJid, msg.pushName);
+    }
+
+    // Extract message content (also handles view-once unwrapping)
+    const { messageType, body, mediaUrl, mimetype, fileName, wasViewOnce } =
       this.extractMessageContent(msg);
 
-    // Download and store media if present
+    // Download and store media if present.
+    // For view-once messages: download immediately without waiting for the
+    // app to "open" it through WhatsApp's normal flow. This ensures the media
+    // is permanently saved regardless of WhatsApp's ephemeral mechanism.
     let mediaLocalPath: string | undefined;
-    if (
+    const shouldDownloadMedia =
       messageType !== MessageType.TEXT &&
       messageType !== MessageType.UNKNOWN &&
-      msg.message
-    ) {
-      mediaLocalPath = await this.downloadAndStoreMedia(
-        msg,
-        messageType,
-        mimetype,
-      );
+      msg.message;
+
+    if (shouldDownloadMedia) {
+      if (!wasViewOnce || this.saveViewOnceMedia) {
+        // For view-once, use the unwrapped message object so downloadMediaMessage
+        // can locate the correct media keys inside the wrapper.
+        mediaLocalPath = await this.downloadAndStoreMedia(
+          msg,
+          messageType,
+          mimetype,
+        );
+      }
     }
 
     // Upsert to avoid duplicates on reconnect replays
@@ -404,9 +490,13 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
         fileName: fileName ?? null,
         timestamp,
         status: MessageStatus.SENT,
+        senderJid,
+        wasViewOnce,
       },
       update: {
         status: MessageStatus.SENT,
+        // Update senderJid in case of replay with more info
+        senderJid,
       },
     });
 
@@ -430,6 +520,8 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
       fileName: saved.fileName,
       timestamp: saved.timestamp.toString(),
       status: saved.status,
+      senderJid: saved.senderJid,
+      wasViewOnce: saved.wasViewOnce,
     });
   }
 
@@ -533,23 +625,241 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
+  // BUG 1: Contact Name Resolution
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Handles 'contacts.upsert' — bulk contact sync from the user's address book.
+   * These are the MOST TRUSTED names (nameSource = 'contact').
+   * They always overwrite any lower-priority name (pushName, group_subject).
+   */
+  private async handleContactsUpsert(contacts: any[]): Promise<void> {
+    for (const contact of contacts) {
+      if (!contact.id) continue;
+      try {
+        const name: string | null =
+          contact.name ?? contact.notify ?? null;
+        await this.upsertContact(
+          contact.id,
+          name,
+          NameSource.CONTACT,
+          contact.imgUrl ?? null,
+        );
+      } catch (err) {
+        this.logger.error(
+          `Failed to upsert contact [jid=${contact.id}]: ${(err as Error).message}`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Handles 'contacts.update' — partial updates to existing contacts.
+   */
+  private async handleContactsUpdate(updates: any[]): Promise<void> {
+    for (const update of updates) {
+      if (!update.id) continue;
+      try {
+        const name: string | null = update.name ?? update.notify ?? null;
+        if (name) {
+          await this.upsertContact(update.id, name, NameSource.CONTACT, update.imgUrl ?? undefined);
+        } else if (update.imgUrl !== undefined) {
+          // Only image update — don't overwrite name
+          await this.prisma.contact.updateMany({
+            where: { jid: update.id },
+            data: { imgUrl: update.imgUrl },
+          });
+        }
+      } catch (err) {
+        this.logger.error(
+          `Failed to update contact [jid=${update.id}]: ${(err as Error).message}`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Handles 'groups.upsert' — new group metadata (including the group subject/name).
+   * nameSource = 'group_subject' — lower priority than 'contact' but higher than 'pushName'.
+   */
+  private async handleGroupsUpsert(groups: any[]): Promise<void> {
+    for (const group of groups) {
+      if (!group.id) continue;
+      try {
+        const name: string | null = group.subject ?? null;
+        await this.upsertContact(group.id, name, NameSource.GROUP_SUBJECT);
+      } catch (err) {
+        this.logger.error(
+          `Failed to upsert group contact [jid=${group.id}]: ${(err as Error).message}`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Handles 'groups.update' — updates to existing group metadata.
+   */
+  private async handleGroupsUpdate(updates: any[]): Promise<void> {
+    for (const update of updates) {
+      if (!update.id) continue;
+      try {
+        if (update.subject) {
+          await this.upsertContact(update.id, update.subject, NameSource.GROUP_SUBJECT);
+        }
+      } catch (err) {
+        this.logger.error(
+          `Failed to update group contact [jid=${update.id}]: ${(err as Error).message}`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Upserts a pushName from an incoming message into the Contact table.
+   *
+   * pushName is UNTRUSTED — it is provided by the sender and can be spoofed.
+   * It is ONLY stored if no higher-priority name (from the user's address book
+   * or group subject) already exists for this JID.
+   */
+  private async upsertContactPushName(
+    jid: string,
+    pushName: string,
+  ): Promise<void> {
+    try {
+      const existing = await this.prisma.contact.findUnique({
+        where: { jid },
+        select: { nameSource: true },
+      });
+
+      const existingPriority = existing?.nameSource
+        ? (NAME_SOURCE_PRIORITY[existing.nameSource] ?? 0)
+        : 0;
+      const pushNamePriority = NAME_SOURCE_PRIORITY[NameSource.PUSH_NAME];
+
+      if (existingPriority > pushNamePriority) {
+        // A better name already exists — do not downgrade it with pushName
+        return;
+      }
+
+      await this.prisma.contact.upsert({
+        where: { jid },
+        create: {
+          jid,
+          pushName,
+          nameSource: NameSource.PUSH_NAME,
+        },
+        update: {
+          pushName,
+          // Only update nameSource if we're the best source so far
+          nameSource: NameSource.PUSH_NAME,
+        },
+      });
+    } catch (err) {
+      this.logger.error(
+        `Failed to upsert pushName for [jid=${jid}]: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  /**
+   * Core contact upsert — respects name source priority.
+   * A name from a higher-priority source will never be overwritten by a
+   * lower-priority source.
+   */
+  private async upsertContact(
+    jid: string,
+    name: string | null,
+    source: NameSource,
+    imgUrl?: string | null,
+  ): Promise<void> {
+    const incomingPriority = NAME_SOURCE_PRIORITY[source] ?? 0;
+
+    const existing = await this.prisma.contact.findUnique({
+      where: { jid },
+      select: { nameSource: true },
+    });
+
+    const existingPriority = existing?.nameSource
+      ? (NAME_SOURCE_PRIORITY[existing.nameSource] ?? 0)
+      : 0;
+
+    const shouldUpdateName = name !== null && incomingPriority >= existingPriority;
+
+    await this.prisma.contact.upsert({
+      where: { jid },
+      create: {
+        jid,
+        name: name,
+        nameSource: name ? source : null,
+        imgUrl: imgUrl ?? null,
+      },
+      update: {
+        ...(shouldUpdateName ? { name, nameSource: source } : {}),
+        ...(imgUrl !== undefined ? { imgUrl } : {}),
+      },
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
   // Message Content Extraction
   // ─────────────────────────────────────────────────────────────────────────
 
+  /**
+   * Extracts message type, body, and media metadata from a WAMessage.
+   *
+   * ── VIEW-ONCE HANDLING ────────────────────────────────────────────────────
+   * View-once messages are wrapped in one of three container types:
+   *   - viewOnceMessage          (original)
+   *   - viewOnceMessageV2        (updated protocol)
+   *   - viewOnceMessageV2Extension (extended variant)
+   *
+   * We unwrap the container to get the inner imageMessage or videoMessage,
+   * then set wasViewOnce = true so callers know to handle it specially.
+   *
+   * ⚠️  PRIVACY NOTE: By capturing view-once media, this code bypasses the
+   * sender's expectation that the media disappears after one view. This
+   * feature should only be used with a full understanding of the privacy
+   * implications for whoever sent the media. The SAVE_VIEW_ONCE_MEDIA=false
+   * config flag can be used to disable persistent storage of view-once media.
+   * ─────────────────────────────────────────────────────────────────────────
+   */
   private extractMessageContent(msg: WAMessage): {
     messageType: MessageType;
     body?: string;
     mediaUrl?: string;
     mimetype?: string;
     fileName?: string;
+    wasViewOnce: boolean;
   } {
-    const m = msg.message;
-    if (!m) return { messageType: MessageType.UNKNOWN };
+    let m = msg.message;
+    if (!m) return { messageType: MessageType.UNKNOWN, wasViewOnce: false };
+
+    // ── Unwrap view-once containers ───────────────────────────────────────
+    let wasViewOnce = false;
+
+    const viewOnceInner =
+      m.viewOnceMessage?.message ??
+      m.viewOnceMessageV2?.message ??
+      (m as any).viewOnceMessageV2Extension?.message ??
+      null;
+
+    if (viewOnceInner) {
+      wasViewOnce = true;
+      // Non-null assertion: viewOnceInner is truthy here, so it is a valid IMessage
+      m = viewOnceInner!;
+      this.logger.log(
+        `Detected view-once message [id=${msg.key.id}] — ${this.saveViewOnceMedia ? 'capturing media' : 'media capture disabled by config'}`,
+      );
+    }
+    // Guard: if the unwrapped inner message is somehow empty, bail out early
+    if (!m) return { messageType: MessageType.UNKNOWN, wasViewOnce };
+    // ─────────────────────────────────────────────────────────────────────
 
     if (m.conversation || m.extendedTextMessage) {
       return {
         messageType: MessageType.TEXT,
         body: m.conversation ?? m.extendedTextMessage?.text ?? undefined,
+        wasViewOnce,
       };
     }
     if (m.imageMessage) {
@@ -557,6 +867,7 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
         messageType: MessageType.IMAGE,
         body: m.imageMessage.caption ?? undefined,
         mimetype: m.imageMessage.mimetype ?? undefined,
+        wasViewOnce,
       };
     }
     if (m.videoMessage) {
@@ -564,12 +875,14 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
         messageType: MessageType.VIDEO,
         body: m.videoMessage.caption ?? undefined,
         mimetype: m.videoMessage.mimetype ?? undefined,
+        wasViewOnce,
       };
     }
     if (m.audioMessage) {
       return {
         messageType: MessageType.AUDIO,
         mimetype: m.audioMessage.mimetype ?? undefined,
+        wasViewOnce,
       };
     }
     if (m.documentMessage) {
@@ -578,22 +891,25 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
         body: m.documentMessage.caption ?? undefined,
         mimetype: m.documentMessage.mimetype ?? undefined,
         fileName: m.documentMessage.fileName ?? undefined,
+        wasViewOnce,
       };
     }
     if (m.stickerMessage) {
       return {
         messageType: MessageType.STICKER,
         mimetype: m.stickerMessage.mimetype ?? undefined,
+        wasViewOnce,
       };
     }
     if (m.locationMessage) {
       return {
         messageType: MessageType.LOCATION,
         body: `${m.locationMessage.degreesLatitude},${m.locationMessage.degreesLongitude}`,
+        wasViewOnce,
       };
     }
 
-    return { messageType: MessageType.UNKNOWN };
+    return { messageType: MessageType.UNKNOWN, wasViewOnce };
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -807,6 +1123,13 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
   // ─────────────────────────────────────────────────────────────────────────
 
   getConnectionInfo(): ConnectionInfo {
+    if (
+      this.connectionInfo.status === 'close' &&
+      !this.isShuttingDown &&
+      !this.reconnectTimer
+    ) {
+      void this.connect();
+    }
     return { ...this.connectionInfo };
   }
 
@@ -826,6 +1149,18 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
   // ─────────────────────────────────────────────────────────────────────────
   // Utilities
   // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Formats a JID into a human-readable fallback (last resort when no
+   * contact name or pushName is available).
+   * Examples:
+   *   "94789418306@s.whatsapp.net" → "94789418306"
+   *   "120363012345678901@g.us"    → "120363012345678901@g.us" (kept as-is)
+   */
+  static formatJidFallback(jid: string): string {
+    if (isJidGroup(jid)) return jid;
+    return jid.replace(/@s\.whatsapp\.net$/, '').replace(/@.*$/, '');
+  }
 
   private setConnectionInfo(info: Partial<ConnectionInfo>): void {
     this.connectionInfo = {

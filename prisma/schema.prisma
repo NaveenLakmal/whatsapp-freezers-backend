@@ -22,12 +22,47 @@ datasource db {
 }
 
 // =============================================================================
+// Contact — display name resolution for individual contacts and groups.
+//
+// nameSource priority (highest → lowest):
+//   'contact'       — name synced from the user's own address book via
+//                     Baileys 'contacts.upsert' / 'contacts.update'
+//   'group_subject' — official group name from 'groups.upsert' / 'groups.update'
+//   'pushName'      — sender-supplied display name from incoming message.
+//                     ⚠️  UNTRUSTED: this is controlled by the sender and can
+//                     be spoofed. It is NEVER allowed to overwrite a name that
+//                     came from the user's own contact list.
+//
+// The GET /chats endpoint derives displayName as:
+//   contact.name ?? contact.pushName ?? formatJid(chat.id)
+// =============================================================================
+model Contact {
+  /// WhatsApp JID — e.g. "94789418306@s.whatsapp.net" or "groupid@g.us"
+  jid        String   @id
+  /// Saved contact name from the user's address book (most trusted)
+  name       String?
+  /// Sender-supplied push name from incoming messages (least trusted)
+  pushName   String?
+  /// 'notify' field from Baileys contacts (alternative to name)
+  notify     String?
+  /// Profile picture URL if available
+  imgUrl     String?
+  /// Source that last set the 'name' field — drives overwrite priority
+  /// Values: 'contact' | 'group_subject' | 'pushName'
+  nameSource String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@map("contacts")
+}
+
+// =============================================================================
 // Chat — represents a WhatsApp conversation (individual or group)
 // =============================================================================
 model Chat {
   /// WhatsApp JID (e.g. "1234567890@s.whatsapp.net" or "groupid@g.us")
   id            String    @id
-  /// Display name of the contact or group
+  /// Display name of the contact or group (may be null — use Contact table)
   name          String?
   /// Number of unread messages (tracked locally)
   unreadCount   Int       @default(0)
@@ -53,9 +88,10 @@ model Message {
   id             String   @id @default(uuid())
   /// The Baileys-generated message ID (from WAMessage.key.id)
   baileysId      String   @unique
-  /// The JID of the conversation this message belongs to
+  /// The JID of the conversation this message belongs to.
+  /// ALWAYS set from msg.key.remoteJid — never from msg.key.participant.
   chatId         String
-  /// The remote JID (sender or recipient)
+  /// The remote JID (group JID for groups, contact JID for 1:1 chats)
   remoteJid      String
   /// true if WE sent this message, false if it was received
   fromMe         Boolean
@@ -75,6 +111,14 @@ model Message {
   timestamp      String
   /// Delivery / read status (PENDING | SENT | DELIVERED | READ | FAILED)
   status         String   @default("PENDING")
+  /// For group messages: the JID of the participant who sent this message.
+  /// For 1:1 messages: same as remoteJid (or 'me' for outgoing).
+  /// NEVER used as a chat grouping key — chatId always holds remoteJid.
+  senderJid      String?
+  /// True if this message was originally a view-once media message.
+  /// The media has been captured and saved permanently despite the sender's
+  /// ephemeral intent. See SAVE_VIEW_ONCE_MEDIA in .env for the config flag.
+  wasViewOnce    Boolean  @default(false)
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 

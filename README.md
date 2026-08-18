@@ -246,3 +246,124 @@ socket.on('connection.status', (data) => print('Status: $data'));
 socket.on('message.new', (data) => print('New message: $data'));
 socket.on('message.status', (data) => print('Message status update: $data'));
 ```
+
+---
+
+## Bug Fixes & New Features (v2)
+
+### Bug 1 — Chat list shows raw JID instead of contact name
+
+**Root cause:** No `Contact` table existed; the `getChats()` query returned raw JID strings.
+
+**Fix:**
+- A `Contact` model is now persisted from Baileys events:
+  - `contacts.upsert` / `contacts.update` → address-book names (`nameSource: 'contact'`)
+  - `groups.upsert` / `groups.update` → group subjects (`nameSource: 'group_subject'`)
+  - `msg.pushName` on incoming messages → untrusted fallback (`nameSource: 'pushName'`)
+- Priority: `contact` > `group_subject` > `pushName`. A higher-trust source **never** gets overwritten by a lower-trust one.
+- `GET /chats` now returns a `displayName` field. Last resort fallback: phone number without the `@s.whatsapp.net` suffix.
+
+**`GET /chats` response now includes:**
+```json
+{
+  "id": "94789418306@s.whatsapp.net",
+  "displayName": "John Doe",
+  "avatarUrl": "https://...",
+  ...
+}
+```
+
+---
+
+### Bug 2 — Group participant messages appear as separate individual chats
+
+**Root cause:** `msg.key.participant` was being used as the `chatId`. It must never be the chat grouping key.
+
+**Fix:**
+- `chatId` is **always** `msg.key.remoteJid` (group JID for groups, contact JID for 1:1).
+- `msg.key.participant` is stored as `senderJid` on the `Message` row — for rendering "Sender: message" in group UI.
+
+**`GET /chats/:jid/messages` response now includes:**
+```json
+{
+  "senderJid": "94712345678@s.whatsapp.net",
+  "wasViewOnce": false,
+  ...
+}
+```
+
+**Manual test — Group message attribution:**
+1. Add this backend account to a WhatsApp group with at least two other members.
+2. Have another group member send a message from their phone.
+3. Call `GET /api/v1/chats` — confirm only **one** chat entry exists for the group JID (ending in `@g.us`). No new individual chat should appear for the sender's phone number.
+4. Call `GET /api/v1/chats/<group-jid>/messages` — confirm the message appears with `senderJid` set to the sender's JID, **not** as a separate chat.
+
+**One-time cleanup script** (for databases created before this fix):
+```bash
+# ⚠️  Take a DB backup first!
+npx ts-node scripts/cleanup-stray-group-chats.ts
+```
+This finds any messages stored under a participant JID instead of the group JID, reassigns them to the correct group chat, and deletes the stray empty chat rows.
+
+---
+
+### New Feature — Save view-once media
+
+> [!WARNING]
+> **Privacy notice:** Enabling this feature bypasses the sender's expectation that media disappears after one view. Only use this with a full understanding of the privacy implications for whoever sent the media.
+
+**How it works:**
+- Baileys wraps view-once content in `viewOnceMessage`, `viewOnceMessageV2`, or `viewOnceMessageV2Extension`.
+- The service unwraps the container, downloads the inner `imageMessage`/`videoMessage` **immediately** on receipt (not when the app "opens" it), stores it to disk, and persists a `Message` row with `wasViewOnce: true`.
+- The media is then accessible via `GET /api/v1/media/:filename` like any other attachment.
+
+**Config flag** (`.env`):
+```env
+# Set to false to disable permanent storage of view-once media
+SAVE_VIEW_ONCE_MEDIA=true
+```
+
+**`GET /chats/:jid/messages` response:**
+```json
+{
+  "messageType": "IMAGE",
+  "wasViewOnce": true,
+  "mediaLocalPath": "./uploads/uuid.jpg",
+  ...
+}
+```
+The Flutter app can use `wasViewOnce: true` to render a badge (e.g. 🔁 "View Once") on the message bubble.
+
+---
+
+## Database Schema (v2)
+
+```
+Contact     jid (PK), name, pushName, notify, imgUrl, nameSource, timestamps
+Chat        id (PK), name, unreadCount, lastMessageAt, timestamps
+Message     id, baileysId, chatId→Chat, remoteJid, fromMe, senderJid,
+            messageType, body, mediaUrl, mediaLocalPath, mimetype, fileName,
+            timestamp, status, wasViewOnce, timestamps
+MediaFile   id, filename, originalName, mimetype, size, localPath, createdAt
+```
+
+---
+
+## Real-Time WebSocket (Socket.io)
+
+Flutter apps connect to the root URL using Socket.io client:
+
+```dart
+import 'package:socket_io_client/socket_io_client.dart' as IO;
+
+final socket = IO.io('https://<your-koyeb-app>.koyeb.app', IO.OptionBuilder()
+  .setTransports(['websocket', 'polling'])
+  .setAuth({'apiKey': 'your-api-key'})
+  .enableAutoConnect()
+  .build());
+
+socket.onConnect((_) => print('Connected to WS'));
+socket.on('connection.status', (data) => print('Status: $data'));
+socket.on('message.new', (data) => print('New message: $data'));
+socket.on('message.status', (data) => print('Message status update: $data'));
+

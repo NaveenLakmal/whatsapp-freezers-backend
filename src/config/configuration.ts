@@ -28,5 +28,11 @@ export default () => ({
   media: {
     /** Local directory for downloaded incoming media files */
     uploadDir: process.env.MEDIA_UPLOAD_DIR ?? './uploads',
+    /**
+     * When true, view-once media messages are downloaded and stored
+     * permanently, bypassing WhatsApp's ephemeral single-view mechanism.
+     * Set SAVE_VIEW_ONCE_MEDIA=false in .env to disable.
+     */
+    saveViewOnceMedia: (process.env.SAVE_VIEW_ONCE_MEDIA ?? 'true') === 'true',
   },
 });
