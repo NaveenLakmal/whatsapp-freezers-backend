@@ -60,4 +60,13 @@ echo "[Startup] Syncing database schema with Prisma..."
 npx prisma db push --skip-generate
 
 echo "[Startup] Starting NestJS application..."
-exec node dist/main
+if [ -f "dist/main.js" ]; then
+  exec node dist/main
+elif [ -f "dist/src/main.js" ]; then
+  exec node dist/src/main
+else
+  echo "[ERROR] Could not find dist/main.js or dist/src/main.js. Listing dist directory:"
+  ls -la dist/
+  exit 1
+fi
+
