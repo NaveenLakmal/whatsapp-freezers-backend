@@ -6,15 +6,14 @@ A production-ready NestJS backend that connects to WhatsApp via the [@whiskeysoc
 
 ## 🔒 Privacy-First Design
 
-This backend enforces a strict **no-presence** policy:
+This backend enforces a strict **offline / background presence** policy:
 
-* ❌ `sendPresenceUpdate()` is **never** called — your "last seen" and "online" statuses are not intentionally broadcast.
+* ❌ `sendPresenceUpdate('available')`, `sendPresenceUpdate('composing')`, and `sendPresenceUpdate('recording')` are **strictly blocked**.
 * ❌ `presenceSubscribe()` is **never** called.
 * ❌ Read receipts are **never** sent automatically upon receiving messages.
 * ⚠️ `POST /chats/:jid/read` is the only read-receipt trigger and is purely opt-in.
 * ✅ The Baileys socket is initialized with `markOnlineOnConnect: false`.
-
-> **Note:** The backend avoids sending intentional presence updates; server-side behavior is managed strictly according to Baileys and WhatsApp protocol defaults.
+* ✅ Explicit `<presence type="unavailable"/>` stanzas are sent upon connection open and maintained periodically in the background so WhatsApp servers treat the backend companion session as background-only, ensuring your status shows **Online only when you open WhatsApp on your phone**.
 
 ---
 
@@ -251,27 +250,37 @@ socket.on('message.status', (data) => print('Message status update: $data'));
 
 ## Bug Fixes & New Features (v2)
 
-### Bug 1 — Chat list shows raw JID instead of contact name
+### Contact Name Resolution (Phone Address Book vs WhatsApp PushName)
 
-**Root cause:** No `Contact` table existed; the `getChats()` query returned raw JID strings.
+**Root cause:** Previously, Baileys sync events combined `contact.name` and `contact.notify` (`contact.name ?? contact.notify`) and saved them under `nameSource = 'contact'`. When messages arrived, Baileys emitted `contacts.update` with `notify` (the remote user's self-chosen WhatsApp profile display name), which overwrote or set the self-chosen pushName as a contact name instead of prioritizing the phone's address book.
 
 **Fix:**
-- A `Contact` model is now persisted from Baileys events:
-  - `contacts.upsert` / `contacts.update` → address-book names (`nameSource: 'contact'`)
-  - `groups.upsert` / `groups.update` → group subjects (`nameSource: 'group_subject'`)
-  - `msg.pushName` on incoming messages → untrusted fallback (`nameSource: 'pushName'`)
-- Priority: `contact` > `group_subject` > `pushName`. A higher-trust source **never** gets overwritten by a lower-trust one.
-- `GET /chats` now returns a `displayName` field. Last resort fallback: phone number without the `@s.whatsapp.net` suffix.
+- Strict separation between phone-saved address book names and self-chosen WhatsApp profile names:
+  - `contact.name` → user's phone address book name (`nameSource: 'phone_contact'`, Priority 4)
+  - `group.subject` → official WhatsApp group name (`nameSource: 'group_subject'`, Priority 3)
+  - `contact.notify` / `msg.pushName` → remote contact's self-chosen display name (`nameSource: 'whatsapp_pushname'`, Priority 2)
+  - JID number fallback → formatted phone number without `@s.whatsapp.net` (`nameSource: 'jid_fallback'`, Priority 1)
+- Once a `phone_contact` or `group_subject` name is stored for a JID, it is **never** overwritten or downgraded by a later `whatsapp_pushname` update from incoming messages.
+- `GET /chats` derives `displayName` using this strict hierarchy.
 
-**`GET /chats` response now includes:**
+**`GET /chats` response includes:**
 ```json
 {
   "id": "94789418306@s.whatsapp.net",
-  "displayName": "John Doe",
+  "displayName": "John Doe (Phone Book Name)",
   "avatarUrl": "https://...",
   ...
 }
 ```
+
+**Manual Test Note — Contact Name Verification:**
+1. Pick 2–3 contacts from your phone who satisfy both conditions:
+   - (a) You have saved them in your phone's address book with a custom name (e.g. *"Mom"*, *"Roshanth Work"*, *"Mechanic Sam"*).
+   - (b) They have configured a different self-set display name on WhatsApp (e.g. *"🌹 Queen 🌹"*, *"Roshanth Gardiarachchi"*, *"Sam The Man"*).
+2. Connect WhatsApp and open the Flutter app (or call `GET /api/v1/chats`).
+3. Verify that the chat list title and chat detail header display the **phone-saved name** (*"Mom"*, *"Roshanth Work"*, *"Mechanic Sam"*) and **NOT** their WhatsApp self-set pushName (*"🌹 Queen 🌹"*, etc.).
+4. Have one of these contacts send a new message while the app is open.
+5. Verify that the incoming message receipt does **not** overwrite the phone-saved name with their pushName.
 
 ---
 

@@ -15,17 +15,21 @@ export class ChatsService {
   /**
    * Returns all known chats, ordered by most recent message first.
    *
-   * ── BUG 1: displayName resolution ────────────────────────────────────────
-   * Each chat result includes a `displayName` field resolved in this priority:
-   *   1. contact.name        — from the user's saved address book (most trusted)
-   *   2. contact.pushName    — sender-supplied name (fallback, untrusted)
-   *   3. formatJidFallback() — strips "@s.whatsapp.net", e.g. "94789418306"
-   *
-   * The raw `jid` is NEVER used directly as a display title in the UI.
+   * ── Contact Name Resolution Priority ─────────────────────────────────────
+   * Each chat result includes a `displayName` field resolved in this strict priority:
+   *   1st priority: Phone-saved contact name from user's address book (nameSource = 'phone_contact')
+   *   2nd priority: Group subject (for group chats, nameSource = 'group_subject' or chat.name)
+   *   3rd priority: Contact's own self-set WhatsApp display name (contact.pushName / contact.notify)
+   *   4th priority: Formatted phone number from JID fallback (e.g. "94789418306")
    * ─────────────────────────────────────────────────────────────────────────
    */
   async getChats() {
     const chats = await this.prisma.chat.findMany({
+      // ── ISSUE 3: Exclude group chats (@g.us) ──────────────────────────────
+      // Prisma doesn't support endsWith in a where filter for string fields,
+      // so we use NOT contains the suffix via a raw string filter workaround:
+      // filter out any id containing '@g.us'.
+      where: { NOT: { id: { contains: '@g.us' } } },
       orderBy: { lastMessageAt: 'desc' },
       include: {
         _count: {
@@ -40,7 +44,14 @@ export class ChatsService {
     const jids = chats.map((c) => c.id);
     const contacts = await this.prisma.contact.findMany({
       where: { jid: { in: jids } },
-      select: { jid: true, name: true, pushName: true, imgUrl: true },
+      select: {
+        jid: true,
+        name: true,
+        pushName: true,
+        notify: true,
+        imgUrl: true,
+        nameSource: true,
+      },
     });
 
     const contactMap = new Map(contacts.map((c) => [c.jid, c]));
@@ -54,10 +65,42 @@ export class ChatsService {
 
     return chats.map((chat) => {
       const contact = contactMap.get(chat.id);
-      const displayName =
-        contact?.name ??
-        contact?.pushName ??
-        formatJid(chat.id);
+      const isGroup = chat.id.endsWith('@g.us');
+
+      let displayName: string;
+
+      // 1st priority: Phone-saved contact name
+      if (
+        contact?.name &&
+        (contact.nameSource === 'phone_contact' ||
+          contact.nameSource === 'contact')
+      ) {
+        displayName = contact.name;
+      }
+      // 2nd priority: Group subject (for group chats only)
+      else if (isGroup && (chat.name || contact?.name)) {
+        displayName = chat.name ?? contact?.name ?? formatJid(chat.id);
+      }
+      // Phone contact name fallback if nameSource was not set but name exists
+      else if (
+        contact?.name &&
+        contact.nameSource !== 'whatsapp_pushname' &&
+        contact.nameSource !== 'pushName'
+      ) {
+        displayName = contact.name;
+      }
+      // 3rd priority: Contact's own self-set WhatsApp display name (pushName / notify)
+      else if (contact?.pushName || contact?.notify) {
+        displayName = (contact.pushName ?? contact.notify)!;
+      }
+      // Chat table fallback name
+      else if (chat.name) {
+        displayName = chat.name;
+      }
+      // 4th priority: Formatted phone number from JID
+      else {
+        displayName = formatJid(chat.id);
+      }
 
       return {
         ...chat,
@@ -75,6 +118,11 @@ export class ChatsService {
    * "view once" badge on media that was originally ephemeral.
    */
   async getMessages(jid: string, pagination: PaginationDto) {
+    // ── ISSUE 3: Reject group JID lookups ────────────────────────────────────────
+    if (jid.endsWith('@g.us')) {
+      throw new NotFoundException(`Group chats are not supported: ${jid}`);
+    }
+
     const chat = await this.prisma.chat.findUnique({ where: { id: jid } });
     if (!chat) {
       throw new NotFoundException(`Chat not found for JID: ${jid}`);

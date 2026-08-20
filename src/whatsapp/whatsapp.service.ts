@@ -48,19 +48,27 @@ const MessageStatus = {
 type MessageStatus = (typeof MessageStatus)[keyof typeof MessageStatus];
 
 // Name source priority constants — controls which source may overwrite which.
-// Priority order (highest → lowest): contact > group_subject > pushName
-const NameSource = {
-  CONTACT: 'contact',
+// Priority order (highest → lowest): phone_contact (4) > group_subject (3) > whatsapp_pushname (2) > jid_fallback (1)
+export const NameSource = {
+  PHONE_CONTACT: 'phone_contact',
   GROUP_SUBJECT: 'group_subject',
-  PUSH_NAME: 'pushName',
+  WHATSAPP_PUSHNAME: 'whatsapp_pushname',
+  JID_FALLBACK: 'jid_fallback',
+  // Backwards-compatible aliases
+  CONTACT: 'phone_contact',
+  PUSH_NAME: 'whatsapp_pushname',
 } as const;
-type NameSource = (typeof NameSource)[keyof typeof NameSource];
+export type NameSource = (typeof NameSource)[keyof typeof NameSource];
 
 // Numeric priority map — higher wins.
-const NAME_SOURCE_PRIORITY: Record<string, number> = {
-  [NameSource.CONTACT]: 3,
-  [NameSource.GROUP_SUBJECT]: 2,
-  [NameSource.PUSH_NAME]: 1,
+export const NAME_SOURCE_PRIORITY: Record<string, number> = {
+  [NameSource.PHONE_CONTACT]: 4,
+  [NameSource.GROUP_SUBJECT]: 3,
+  [NameSource.WHATSAPP_PUSHNAME]: 2,
+  [NameSource.JID_FALLBACK]: 1,
+  // Legacy aliases
+  contact: 4,
+  pushName: 2,
 };
 
 // ---------------------------------------------------------------------------
@@ -122,6 +130,9 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
   private readonly MAX_RECONNECT_DELAY_MS = 60_000; // 1 minute cap
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
+  /** Background interval timer to periodically re-assert unavailable presence */
+  private unavailablePresenceTimer: ReturnType<typeof setInterval> | null = null;
+
   /** Whether the service is shutting down (prevents reconnect loops) */
   private isShuttingDown = false;
 
@@ -154,6 +165,7 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
 
   async onModuleDestroy(): Promise<void> {
     this.isShuttingDown = true;
+    this.stopUnavailablePresenceInterval();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
     }
@@ -204,7 +216,6 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
       // ── PRESENCE POLICY ──────────────────────────────────────────────────
       // markOnlineOnConnect: false — prevents Baileys from calling
       // sendPresenceUpdate('available') immediately on connection open.
-      // This is the FIRST layer of presence suppression.
       // ─────────────────────────────────────────────────────────────────────
       markOnlineOnConnect: false,
 
@@ -218,29 +229,26 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
       printQRInTerminal: false,
     });
 
-    // ── PRESENCE: Monkey-patch sendPresenceUpdate to a permanent no-op ────
+    // ── PRESENCE: Suppress 'available' / 'composing', allow 'unavailable' ──
     //
     // WHY THIS IS NECESSARY:
-    // markOnlineOnConnect: false only stops the initial 'available' broadcast
-    // on connect. However, Baileys can internally call sendPresenceUpdate()
-    // during other operations (e.g. during message sends in some versions).
-    // WhatsApp's server also interprets an active companion-device WebSocket
-    // as "online" if ANY presence update of type 'available' is received.
+    // By default, WhatsApp server treats an open companion WebSocket as active
+    // ("Online") unless the client explicitly sends `<presence type="unavailable"/>`.
     //
-    // This patch completely disables the function at the socket level,
-    // making it IMPOSSIBLE for any code path — internal or external —
-    // to send a presence update of any kind ('available', 'composing',
-    // 'recording', 'paused', 'unavailable').
-    //
-    // DO NOT REMOVE THIS — removing it will cause WhatsApp to show
-    // the account as "online" while the backend is running.
+    // Here we ensure:
+    // 1. 'available', 'composing', 'recording' are ALWAYS BLOCKED.
+    // 2. 'unavailable' is ALLOWED and forwarded to WhatsApp so the session
+    //    stays in background mode and never marks the account as Online.
     // ─────────────────────────────────────────────────────────────────────
     this.sock.sendPresenceUpdate = async (
-      _type: any,
+      type: any,
       _jid?: string,
     ): Promise<void> => {
-      // PRESENCE: intentionally suppressed — this is a permanent no-op.
-      // WhatsApp 'online', 'composing', 'recording', 'unavailable' are NEVER sent.
+      if (type === 'unavailable') {
+        await this.sendUnavailablePresence();
+        return;
+      }
+      // PRESENCE: 'available', 'composing', 'recording' are intentionally blocked.
       return;
     };
 
@@ -294,6 +302,19 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
       void this.handleContactsUpdate(updates);
     });
 
+    // ── Initial History Sync ──────────────────────────────────────────────
+    // When companion session connects/syncs, Baileys emits messaging-history.set
+    // containing contacts, chats, and recent messages.
+    (this.sock.ev as any).on('messaging-history.set', ({ contacts, chats }: any) => {
+      if (contacts && Array.isArray(contacts) && contacts.length > 0) {
+        this.logger.log(`Received messaging-history.set with ${contacts.length} contacts.`);
+        void this.handleContactsUpsert(contacts);
+      }
+      if (chats && Array.isArray(chats) && chats.length > 0) {
+        void this.handleChatsUpsert(chats);
+      }
+    });
+
     // ── BUG 1: Group name resolution ─────────────────────────────────────
     // Group subjects (names) come from these events and are stored in the
     // Contact table under nameSource='group_subject'.
@@ -331,14 +352,17 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
       this.reconnectAttempts = 0; // reset backoff on successful connect
       this.setConnectionInfo({ status: 'open' });
 
-      // ── PRESENCE: We do NOT call sendPresenceUpdate('available') here ──
-      // The standard pattern in many Baileys examples is to call
-      // sendPresenceUpdate('available') on connection open. We intentionally
-      // omit this to keep the account's presence hidden.
-      // ──────────────────────────────────────────────────────────────────
+      // ── PRESENCE FIX: Tell WhatsApp servers this session is UNAVAILABLE ──
+      // By default, WhatsApp server treats an open companion socket as active
+      // ("Online"). We must explicitly send <presence type="unavailable"/> so
+      // WhatsApp knows this session is in background mode. Your status will
+      // ONLY show "Online" when you actively open WhatsApp on your phone.
+      this.startUnavailablePresenceInterval();
     }
 
     if (connection === 'close') {
+      this.stopUnavailablePresenceInterval();
+
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const reason =
         DisconnectReason[
@@ -390,6 +414,62 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
     }, delay);
   }
 
+  /**
+   * Explicitly informs WhatsApp servers that this backend companion session is
+   * in the background / UNAVAILABLE.
+   *
+   * WHY THIS IS REQUIRED:
+   * By default, when a companion device (WhatsApp Web / Baileys) opens a WebSocket
+   * connection, WhatsApp servers assume the companion device is active in the
+   * foreground (i.e. "Online") unless the client explicitly sends `<presence type="unavailable"/>`.
+   *
+   * By sending 'unavailable', WhatsApp marks this companion session as inactive / background,
+   * meaning your WhatsApp status will ONLY show "Online" when you actively open WhatsApp
+   * on your primary phone.
+   */
+  private async sendUnavailablePresence(): Promise<void> {
+    if (!this.sock) return;
+    try {
+      const me = (this.sock.authState?.creds as any)?.me;
+      const name = me?.name || 'WhatsApp';
+      if (typeof (this.sock as any).sendNode === 'function') {
+        await (this.sock as any).sendNode({
+          tag: 'presence',
+          attrs: {
+            name: name.replace(/@/g, ''),
+            type: 'unavailable',
+          },
+        });
+        this.logger.debug('Presence set to unavailable (background mode).');
+      }
+    } catch (err) {
+      this.logger.warn(
+        `Failed to send unavailable presence: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  /**
+   * Starts a periodic timer to re-assert 'unavailable' presence every 2 minutes.
+   */
+  private startUnavailablePresenceInterval(): void {
+    this.stopUnavailablePresenceInterval();
+    void this.sendUnavailablePresence();
+    this.unavailablePresenceTimer = setInterval(() => {
+      void this.sendUnavailablePresence();
+    }, 2 * 60 * 1000);
+  }
+
+  /**
+   * Stops the periodic unavailable presence timer.
+   */
+  private stopUnavailablePresenceInterval(): void {
+    if (this.unavailablePresenceTimer) {
+      clearInterval(this.unavailablePresenceTimer);
+      this.unavailablePresenceTimer = null;
+    }
+  }
+
   // ─────────────────────────────────────────────────────────────────────────
   // Message Handling
   // ─────────────────────────────────────────────────────────────────────────
@@ -436,6 +516,10 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
     // Skip broadcast/status messages
     if (isJidBroadcast(jid)) return;
     if (jid === 'status@broadcast') return;
+
+    // ── ISSUE 3: Skip group messages entirely ────────────────────────────────
+    // Group JIDs end in @g.us. We only handle 1:1 private chats.
+    if (isJidGroup(jid)) return;
 
     const baileysId = msg.key.id ?? '';
     const fromMe = msg.key.fromMe ?? false;
@@ -650,6 +734,12 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
           Math.floor(Date.now() / 1000));
     const lastMessageAt = new Date(ts * 1000);
 
+    // ── ISSUE 1: Detect whether this is a brand-new chat ────────────────────
+    // We check for an existing row BEFORE the upsert so we can emit a
+    // 'chat.upsert' socket event for new chats. This lets Flutter's
+    // ChatsNotifier append a newly-seen contact without a pull-to-refresh.
+    const existing = await this.prisma.chat.findUnique({ where: { id: jid } });
+
     await this.prisma.chat.upsert({
       where: { id: jid },
       create: {
@@ -663,6 +753,16 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
         unreadCount: msg.key.fromMe ? undefined : { increment: 1 },
       },
     });
+
+    // Emit a real-time event so Flutter can add this chat to its list immediately
+    if (!existing) {
+      this.events.emit('chat.upsert', {
+        id: jid,
+        jid,
+        unreadCount: msg.key.fromMe ? 0 : 1,
+        lastMessageAt: lastMessageAt.toISOString(),
+      });
+    }
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -670,22 +770,56 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
   // ─────────────────────────────────────────────────────────────────────────
 
   /**
-   * Handles 'contacts.upsert' — bulk contact sync from the user's address book.
-   * These are the MOST TRUSTED names (nameSource = 'contact').
-   * They always overwrite any lower-priority name (pushName, group_subject).
+   * Handles 'contacts.upsert' — contact sync from Baileys.
+   *
+   * Baileys Contact field breakdown:
+   *   - contact.name         : Phone's address-book saved name (HIGHEST TRUST, nameSource = 'phone_contact').
+   *   - contact.notify       : Contact's self-chosen WhatsApp display name / pushName (nameSource = 'whatsapp_pushname').
+   *   - contact.verifiedName : Verified WhatsApp Business name (nameSource = 'whatsapp_pushname').
+   *   - contact.imgUrl       : Profile avatar URL.
+   *
+   * Crucially: contact.notify MUST NOT be treated as a phone-saved name!
    */
   private async handleContactsUpsert(contacts: any[]): Promise<void> {
     for (const contact of contacts) {
       if (!contact.id) continue;
       try {
-        const name: string | null =
-          contact.name ?? contact.notify ?? null;
-        await this.upsertContact(
-          contact.id,
-          name,
-          NameSource.CONTACT,
-          contact.imgUrl ?? null,
-        );
+        // 1. Phone address book name (highest trust)
+        const hasPhoneName =
+          typeof contact.name === 'string' && contact.name.trim().length > 0;
+
+        if (hasPhoneName) {
+          await this.upsertContact(
+            contact.id,
+            contact.name.trim(),
+            NameSource.PHONE_CONTACT,
+            contact.imgUrl ?? null,
+          );
+        } else if (contact.imgUrl) {
+          // If only image was provided, update avatar without touching name
+          await this.prisma.contact.upsert({
+            where: { jid: contact.id },
+            create: {
+              jid: contact.id,
+              imgUrl: contact.imgUrl,
+            },
+            update: {
+              imgUrl: contact.imgUrl,
+            },
+          });
+        }
+
+        // 2. Self-chosen display name (pushName / notify)
+        const pushNameValue =
+          (typeof contact.notify === 'string' && contact.notify.trim().length > 0)
+            ? contact.notify.trim()
+            : (typeof contact.verifiedName === 'string' && contact.verifiedName.trim().length > 0)
+              ? contact.verifiedName.trim()
+              : null;
+
+        if (pushNameValue) {
+          await this.upsertContactPushName(contact.id, pushNameValue);
+        }
       } catch (err) {
         this.logger.error(
           `Failed to upsert contact [jid=${contact.id}]: ${(err as Error).message}`,
@@ -701,14 +835,32 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
     for (const update of updates) {
       if (!update.id) continue;
       try {
-        const name: string | null = update.name ?? update.notify ?? null;
-        if (name) {
-          await this.upsertContact(update.id, name, NameSource.CONTACT, update.imgUrl ?? undefined);
-        } else if (update.imgUrl !== undefined) {
-          // Only image update — don't overwrite name
-          await this.prisma.contact.updateMany({
+        // Update phone address-book name if explicitly provided
+        if (typeof update.name === 'string' && update.name.trim().length > 0) {
+          await this.upsertContact(
+            update.id,
+            update.name.trim(),
+            NameSource.PHONE_CONTACT,
+            update.imgUrl ?? undefined,
+          );
+        }
+
+        // Update self-chosen WhatsApp display name (notify)
+        if (typeof update.notify === 'string' && update.notify.trim().length > 0) {
+          await this.upsertContactPushName(update.id, update.notify.trim());
+        }
+
+        // Update image URL if provided without a name change
+        if (update.imgUrl !== undefined && !update.name) {
+          await this.prisma.contact.upsert({
             where: { jid: update.id },
-            data: { imgUrl: update.imgUrl },
+            create: {
+              jid: update.id,
+              imgUrl: update.imgUrl,
+            },
+            update: {
+              imgUrl: update.imgUrl,
+            },
           });
         }
       } catch (err) {
@@ -721,7 +873,7 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
 
   /**
    * Handles 'groups.upsert' — new group metadata (including the group subject/name).
-   * nameSource = 'group_subject' — lower priority than 'contact' but higher than 'pushName'.
+   * nameSource = 'group_subject' — lower priority than 'phone_contact' but higher than 'whatsapp_pushname'.
    */
   private async handleGroupsUpsert(groups: any[]): Promise<void> {
     for (const group of groups) {
@@ -756,11 +908,12 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Upserts a pushName from an incoming message into the Contact table.
+   * Upserts a pushName from an incoming message or pushnames sync into the Contact table.
    *
-   * pushName is UNTRUSTED — it is provided by the sender and can be spoofed.
-   * It is ONLY stored if no higher-priority name (from the user's address book
-   * or group subject) already exists for this JID.
+   * pushName is UNTRUSTED — it is provided by the remote sender and can be spoofed.
+   * It is stored in the pushName / notify fields.
+   * It will NEVER overwrite the 'name' field or downgrade 'nameSource' if a higher-priority
+   * source ('phone_contact' or 'group_subject') is already recorded.
    */
   private async upsertContactPushName(
     jid: string,
@@ -769,16 +922,24 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
     try {
       const existing = await this.prisma.contact.findUnique({
         where: { jid },
-        select: { nameSource: true },
+        select: { nameSource: true, name: true },
       });
 
       const existingPriority = existing?.nameSource
         ? (NAME_SOURCE_PRIORITY[existing.nameSource] ?? 0)
         : 0;
-      const pushNamePriority = NAME_SOURCE_PRIORITY[NameSource.PUSH_NAME];
+      const pushNamePriority = NAME_SOURCE_PRIORITY[NameSource.WHATSAPP_PUSHNAME];
 
-      if (existingPriority > pushNamePriority) {
-        // A better name already exists — do not downgrade it with pushName
+      // If existing contact already has a higher priority name (e.g. phone_contact or group_subject),
+      // store pushName in pushName/notify column for reference, but NEVER overwrite the 'name' or 'nameSource' column.
+      if (existing && existingPriority > pushNamePriority) {
+        await this.prisma.contact.update({
+          where: { jid },
+          data: {
+            pushName,
+            notify: pushName,
+          },
+        });
         return;
       }
 
@@ -787,12 +948,14 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
         create: {
           jid,
           pushName,
-          nameSource: NameSource.PUSH_NAME,
+          notify: pushName,
+          nameSource: NameSource.WHATSAPP_PUSHNAME,
         },
         update: {
           pushName,
-          // Only update nameSource if we're the best source so far
-          nameSource: NameSource.PUSH_NAME,
+          notify: pushName,
+          // Only update nameSource if we are equal or higher priority
+          nameSource: NameSource.WHATSAPP_PUSHNAME,
         },
       });
     } catch (err) {
@@ -817,7 +980,7 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
 
     const existing = await this.prisma.contact.findUnique({
       where: { jid },
-      select: { nameSource: true },
+      select: { nameSource: true, name: true },
     });
 
     const existingPriority = existing?.nameSource

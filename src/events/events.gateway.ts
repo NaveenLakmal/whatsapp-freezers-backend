@@ -140,4 +140,21 @@ export class EventsGateway
   handleMessageStatus(payload: Record<string, unknown>): void {
     this.server.emit('message.status', payload);
   }
+
+  /**
+   * Broadcasts a newly-created chat to all Flutter clients.
+   * Fired by WhatsAppService.upsertChat() the first time a message arrives
+   * from a JID that has no existing Chat row — i.e. a brand-new contact.
+   *
+   * Flutter's ChatsNotifier subscribes to this event so new contacts appear
+   * in the chat list immediately without the user pulling to refresh.
+   *
+   * Payload shape:
+   * { id: string, jid: string, unreadCount: number, lastMessageAt: string }
+   */
+  @OnEvent('chat.upsert')
+  handleChatUpsert(payload: Record<string, unknown>): void {
+    this.logger.log(`Emitting chat.upsert [jid=${payload['jid']}]`);
+    this.server.emit('chat.upsert', payload);
+  }
 }
