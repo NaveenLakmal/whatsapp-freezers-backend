@@ -161,6 +161,23 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
     this.logger.log('WhatsApp socket closed.');
   }
 
+  /**
+   * Gracefully reconnects the Baileys WebSocket without clearing auth state.
+   * This causes Baileys to replay recent messages through persistMessage,
+   * so any messages previously stored as UNKNOWN can be upgraded to their
+   * correct type (e.g. IMAGE for view-once) if the fix is now in place.
+   */
+  async reconnect(): Promise<void> {
+    this.logger.log('Manual reconnect requested — cycling Baileys socket...');
+    // Gracefully end the current socket; the connection-state handler will
+    // call scheduleReconnect() which calls connect() again automatically.
+    if (this.sock) {
+      this.sock.end(new Error('manual-reconnect'));
+    } else {
+      await this.connect();
+    }
+  }
+
   // ─────────────────────────────────────────────────────────────────────────
   // Connection
   // ─────────────────────────────────────────────────────────────────────────
@@ -474,7 +491,11 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
       }
     }
 
-    // Upsert to avoid duplicates on reconnect replays
+    // Upsert to avoid duplicates on reconnect replays.
+    // The update block also re-applies content fields so that messages that
+    // were previously stored as UNKNOWN (e.g. before a bug fix) get corrected
+    // automatically when Baileys replays them on the next reconnect.
+    // We only overwrite messageType if we have a better classification than UNKNOWN.
     const saved = await this.prisma.message.upsert({
       where: { baileysId },
       create: {
@@ -495,8 +516,18 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
       },
       update: {
         status: MessageStatus.SENT,
-        // Update senderJid in case of replay with more info
         senderJid,
+        // Upgrade UNKNOWN → correct type when Baileys replays the message
+        ...(messageType !== MessageType.UNKNOWN && {
+          messageType,
+          body: body ?? null,
+          mediaUrl: mediaUrl ?? null,
+          mimetype: mimetype ?? null,
+          fileName: fileName ?? null,
+          wasViewOnce,
+        }),
+        // Always update mediaLocalPath if we just downloaded the media
+        ...(mediaLocalPath && { mediaLocalPath }),
       },
     });
 
@@ -504,6 +535,16 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
     // Read receipts are never sent automatically. The Flutter app can
     // trigger read receipts via POST /chats/:jid/read if desired.
     // ─────────────────────────────────────────────────────────────────────
+
+    // ── Bug 2 fix: resolve local media path → HTTP URL for socket event ──────
+    // The backend stores media at a local path (e.g. /app/uploads/uuid.jpg).
+    // Convert it to /media/uuid.jpg so the Flutter app can fetch it via
+    // GET /media/:filename without needing server filesystem access.
+    const socketMediaUrl: string | null =
+      saved.mediaUrl ??
+      (saved.mediaLocalPath
+        ? `/media/${path.basename(saved.mediaLocalPath)}`
+        : null);
 
     // Emit real-time event to connected Flutter clients
     this.events.emit('message.new', {
@@ -514,7 +555,7 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
       fromMe: saved.fromMe,
       messageType: saved.messageType,
       body: saved.body,
-      mediaUrl: saved.mediaUrl,
+      mediaUrl: socketMediaUrl,
       mediaLocalPath: saved.mediaLocalPath,
       mimetype: saved.mimetype,
       fileName: saved.fileName,
@@ -835,20 +876,32 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
     if (!m) return { messageType: MessageType.UNKNOWN, wasViewOnce: false };
 
     // ── Unwrap view-once containers ───────────────────────────────────────
+    // WhatsApp uses several proto formats for view-once depending on client version:
+    //   1. viewOnceMessage / viewOnceMessageV2 / viewOnceMessageV2Extension wrappers
+    //   2. imageMessage.viewOnce === true  (newer clients — no outer wrapper)
+    //   3. ephemeralMessage outer wrapper (some clients double-wrap)
     let wasViewOnce = false;
 
+    // Unwrap ephemeralMessage outer wrapper first (some clients use this)
+    const ephemeralInner = (m as any).ephemeralMessage?.message;
+    if (ephemeralInner) {
+      m = ephemeralInner;
+    }
+
+    // Unwrap explicit view-once container wrappers (all known variants)
+    // m is guaranteed non-null here since we bailed out above if it was null
+    const currentM = m!;
     const viewOnceInner =
-      m.viewOnceMessage?.message ??
-      m.viewOnceMessageV2?.message ??
-      (m as any).viewOnceMessageV2Extension?.message ??
+      currentM.viewOnceMessage?.message ??
+      currentM.viewOnceMessageV2?.message ??
+      (currentM as any).viewOnceMessageV2Extension?.message ??
       null;
 
     if (viewOnceInner) {
       wasViewOnce = true;
-      // Non-null assertion: viewOnceInner is truthy here, so it is a valid IMessage
       m = viewOnceInner!;
       this.logger.log(
-        `Detected view-once message [id=${msg.key.id}] — ${this.saveViewOnceMedia ? 'capturing media' : 'media capture disabled by config'}`,
+        `Detected view-once (wrapper) [id=${msg.key.id}] — ${this.saveViewOnceMedia ? 'capturing media' : 'media capture disabled by config'}`,
       );
     }
     // Guard: if the unwrapped inner message is somehow empty, bail out early
@@ -863,6 +916,13 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
       };
     }
     if (m.imageMessage) {
+      // Newer WhatsApp clients set viewOnce directly on imageMessage (no wrapper)
+      if (!wasViewOnce && (m.imageMessage as any).viewOnce) {
+        wasViewOnce = true;
+        this.logger.log(
+          `Detected view-once (direct flag on imageMessage) [id=${msg.key.id}]`,
+        );
+      }
       return {
         messageType: MessageType.IMAGE,
         body: m.imageMessage.caption ?? undefined,
@@ -871,6 +931,13 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
       };
     }
     if (m.videoMessage) {
+      // Also check direct viewOnce flag on videoMessage
+      if (!wasViewOnce && (m.videoMessage as any).viewOnce) {
+        wasViewOnce = true;
+        this.logger.log(
+          `Detected view-once video (direct flag) [id=${msg.key.id}]`,
+        );
+      }
       return {
         messageType: MessageType.VIDEO,
         body: m.videoMessage.caption ?? undefined,
@@ -907,6 +974,16 @@ export class WhatsAppService implements OnModuleInit, OnModuleDestroy {
         body: `${m.locationMessage.degreesLatitude},${m.locationMessage.degreesLongitude}`,
         wasViewOnce,
       };
+    }
+
+    // Log the unknown proto fields to help diagnose unhandled message types
+    const knownFields = Object.keys(m).filter(
+      (k) => (m as any)[k] != null && k !== '$type',
+    );
+    if (knownFields.length > 0) {
+      this.logger.warn(
+        `Unknown message type [id=${msg.key.id}], proto fields present: [${knownFields.join(', ')}]`,
+      );
     }
 
     return { messageType: MessageType.UNKNOWN, wasViewOnce };

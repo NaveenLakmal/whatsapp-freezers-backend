@@ -36,4 +36,17 @@ export class ConnectionService {
       message: 'Logged out. Scan the QR at GET /connection/qr to reconnect.',
     };
   }
+
+  /**
+   * Gracefully cycles the Baileys socket without clearing auth state.
+   * Baileys will replay recent messages through the updated persistMessage
+   * logic, upgrading any UNKNOWN messages to their correct type.
+   */
+  async reconnect(): Promise<{ success: boolean; message: string }> {
+    await this.whatsapp.reconnect();
+    return {
+      success: true,
+      message: 'Reconnect triggered. Baileys will replay recent messages shortly.',
+    };
+  }
 }

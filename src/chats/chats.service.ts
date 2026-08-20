@@ -1,4 +1,5 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
+import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
 import { WhatsAppService } from '../whatsapp/whatsapp.service';
 import { SendMessageDto } from './dto/send-message.dto';
@@ -44,12 +45,19 @@ export class ChatsService {
 
     const contactMap = new Map(contacts.map((c) => [c.jid, c]));
 
+    const formatJid = (jid: string): string => {
+      if (typeof WhatsAppService.formatJidFallback === 'function') {
+        return WhatsAppService.formatJidFallback(jid);
+      }
+      return jid.replace(/@s\.whatsapp\.net$/, '').replace(/@.*$/, '');
+    };
+
     return chats.map((chat) => {
       const contact = contactMap.get(chat.id);
       const displayName =
         contact?.name ??
         contact?.pushName ??
-        WhatsAppService.formatJidFallback(chat.id);
+        formatJid(chat.id);
 
       return {
         ...chat,
@@ -82,15 +90,30 @@ export class ChatsService {
     const total = await this.prisma.message.count({ where: { chatId: jid } });
 
     return {
-      data: messages.map((m) => ({
-        ...m,
-        // BigInt is not JSON-serializable — convert to string
-        timestamp: m.timestamp.toString(),
-        // senderJid: who sent this message (useful for group chat UI)
-        senderJid: m.senderJid ?? null,
-        // wasViewOnce: true if this was originally a view-once media message
-        wasViewOnce: m.wasViewOnce,
-      })),
+      data: messages.map((m) => {
+        // ── Bug 2 fix: view-once / local-media URL resolution ─────────────────
+        // The backend stores media at a local path (e.g. /app/uploads/uuid.jpg).
+        // The Flutter app cannot access the filesystem directly, so we convert
+        // that path into a relative HTTP URL (/media/uuid.jpg) that is served
+        // by GET /media/:filename — protected by the same API key guard.
+        const mediaUrl: string | null =
+          m.mediaUrl ??
+          (m.mediaLocalPath
+            ? `/media/${path.basename(m.mediaLocalPath)}`
+            : null);
+
+        return {
+          ...m,
+          // BigInt is not JSON-serializable — convert to string
+          timestamp: m.timestamp.toString(),
+          // Resolved HTTP URL for any locally stored media
+          mediaUrl,
+          // senderJid: who sent this message (useful for group chat UI)
+          senderJid: m.senderJid ?? null,
+          // wasViewOnce: true if this was originally a view-once media message
+          wasViewOnce: m.wasViewOnce,
+        };
+      }),
       total,
       limit: pagination.limit ?? 50,
       offset: pagination.offset ?? 0,

@@ -4,6 +4,7 @@ import {
   Get,
   HttpCode,
   HttpStatus,
+  Post,
   UseGuards,
 } from '@nestjs/common';
 import { ApiKeyGuard } from '../auth/api-key.guard';
@@ -138,5 +139,22 @@ export class ConnectionController {
   @HttpCode(HttpStatus.OK)
   logout() {
     return this.connection.logout();
+  }
+
+  /**
+   * POST /connection/reconnect
+   *
+   * Gracefully cycles the Baileys WebSocket without clearing auth state.
+   * Baileys replays recent messages through the updated persistMessage logic,
+   * which means any messages previously stored as UNKNOWN (e.g. view-once
+   * images received before a bug fix) will be upgraded to the correct type
+   * automatically on replay.
+   *
+   * Call this after deploying a backend fix to re-process stuck messages.
+   */
+  @Post('reconnect')
+  @HttpCode(HttpStatus.OK)
+  reconnect() {
+    return this.connection.reconnect();
   }
 }

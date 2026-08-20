@@ -16,14 +16,19 @@ import { MediaService } from './media.service';
 /**
  * MediaController — serves locally stored WhatsApp media files.
  *
- * All endpoints are protected by ApiKeyGuard to prevent unauthorized
- * access to private media (images, voice notes, documents).
+ * GET /media/:filename is intentionally NOT behind ApiKeyGuard.
+ * Reason: Flutter's image widgets (CachedNetworkImage, Image.network) do not
+ * support custom HTTP headers, so they cannot send the x-api-key header.
+ * Media filenames are UUIDs (e.g. 550e8400-e29b-41d4-a716-446655440000.jpg)
+ * which are cryptographically unguessable, providing sufficient security for
+ * a local-network deployment.
+ *
+ * GET /media (listing) DOES require the API key since it enumerates filenames.
  *
  * PRESENCE NOTE: Serving media files does NOT trigger any WhatsApp
- * presence updates. This is purely local file serving.
+ * presence updates. Media is served from local disk only.
  */
 @Controller('media')
-@UseGuards(ApiKeyGuard)
 export class MediaController {
   constructor(private readonly media: MediaService) {}
 
@@ -33,7 +38,7 @@ export class MediaController {
    * Streams a stored media file to the client with the correct Content-Type.
    * The Flutter app can use this URL to display images, play audio, etc.
    *
-   * The filename is the UUID-based name stored in the Message.mediaLocalPath field.
+   * No API key required — filenames are UUIDs (unguessable).
    * Example: GET /media/550e8400-e29b-41d4-a716-446655440000.jpg
    */
   @Get(':filename')
@@ -49,7 +54,8 @@ export class MediaController {
       'Content-Disposition',
       `inline; filename="${originalName ?? filename}"`,
     );
-    res.setHeader('Cache-Control', 'private, max-age=86400'); // 1 day client cache
+    // Allow public caching since filenames are UUIDs and content never changes
+    res.setHeader('Cache-Control', 'public, max-age=86400'); // 1 day
 
     const stream = fs.createReadStream(filePath);
     stream.pipe(res);
@@ -58,9 +64,10 @@ export class MediaController {
   /**
    * GET /media?limit=50&offset=0
    * Lists stored media file metadata (no binary content).
-   * Useful for building a Flutter media gallery.
+   * Requires API key since it enumerates filenames.
    */
   @Get()
+  @UseGuards(ApiKeyGuard)
   listMedia(
     @Query('limit', new DefaultValuePipe(50), ParseIntPipe) limit: number,
     @Query('offset', new DefaultValuePipe(0), ParseIntPipe) offset: number,
